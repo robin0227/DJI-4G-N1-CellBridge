@@ -4,7 +4,7 @@ import sqlite3
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 spec = importlib.util.spec_from_file_location('storage', Path(__file__).with_name('storage-maintenance.py'))
 storage = importlib.util.module_from_spec(spec)
@@ -33,7 +33,11 @@ class StorageMaintenanceTests(unittest.TestCase):
     def test_preserves_all_database_content_and_limits_log(self):
         before = list(self.db.iterdump())
         original = self.log.read_bytes()
-        report = storage.maintain(self.base, apply=True)
+        # The fixture owns this closed log. Shared Linux CI hosts can have
+        # unrelated unreadable /proc descriptors; production correctly
+        # treats that uncertainty as "in use" and must keep the log intact.
+        with patch.object(storage, 'in_use', return_value=False):
+            report = storage.maintain(self.base, apply=True)
         self.assertEqual(list(self.db.iterdump()), before)
         self.assertEqual(self.log.read_bytes(), original[-storage.LOG_KEEP:])
         self.assertEqual(report['database_rows_deleted'], 0)
@@ -53,6 +57,22 @@ class StorageMaintenanceTests(unittest.TestCase):
             report = storage.maintain(self.base, apply=True)
         self.assertEqual(self.log.stat().st_ino, before.st_ino)
         self.assertEqual(self.log.stat().st_size, before.st_size)
+        self.assertTrue(any('in use' in warning for warning in report['warnings']))
+
+    def test_in_use_detects_matching_inode(self):
+        descriptor = Mock()
+        descriptor.stat.return_value = self.log.stat()
+        with patch.object(Path, 'glob', return_value=[descriptor]):
+            self.assertTrue(storage.in_use(self.log))
+
+    def test_unreadable_descriptor_keeps_log_safe(self):
+        descriptor = Mock()
+        descriptor.stat.side_effect = PermissionError('unreadable descriptor')
+        before = self.log.read_bytes()
+        with patch.object(Path, 'glob', return_value=[descriptor]):
+            report = storage.maintain(self.base, apply=True)
+        self.assertEqual(self.log.read_bytes(), before)
+        self.assertFalse(report['launcher_log_trimmed'])
         self.assertTrue(any('in use' in warning for warning in report['warnings']))
 
     def test_checkpoint_does_not_wait_for_writer(self):
