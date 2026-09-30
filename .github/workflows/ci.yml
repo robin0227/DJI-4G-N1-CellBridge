@@ -1,0 +1,50 @@
+name: source-tests-and-arm64-build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: gateway/go.sum
+      - name: Publication audit
+        run: python3 tools/audit-release.py
+      - name: Go tests and vet
+        working-directory: gateway
+        run: |
+          go test ./...
+          go vet ./...
+      - name: Storage maintenance regression tests
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 -m unittest discover -s openwrt -p 'test_*.py' -v
+      - name: Shell syntax
+        run: |
+          for script in openwrt/*.sh openwrt/openwrt-init openwrt/module-tools/adb tools/*.sh; do
+            sh -n "$script"
+          done
+      - name: Static Linux ARM64 package without vendor runtime
+        run: sh tools/build.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cellbridge-n1-openwrt-linux-arm64
+          path: |
+            dist/cellbridge-gateway-linux-arm64
+            dist/SHA256SUMS
+            dist/cellbridge-n1-openwrt.tar.gz
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+export PYTHONPATH="$DIR/../vendor:$DIR"
+exec python3 "$DIR/adb.py" "$@"
