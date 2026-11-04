@@ -15,6 +15,13 @@ type PCMUTransport interface {
 	OnPCMUFrame(func([]byte))
 }
 
+// SequencedPCMUTransport is implemented by RTP media that can report each
+// frame's RTP sequence number, letting the jitter buffer reorder and drop
+// duplicates. Transports without it get arrival-order sequence numbers.
+type SequencedPCMUTransport interface {
+	OnSequencedPCMUFrame(func(seq uint16, frame []byte))
+}
+
 // Bridge is the only place where the modem's signed PCM representation is
 // converted to the V1 WebRTC PCMU wire format. It enforces 20 ms / 160-sample
 // frames in both directions and keeps media work off HTTP handlers.
@@ -34,7 +41,7 @@ type Bridge struct {
 	clientPeakMax     int
 	cellularNonZero   uint64
 	clientNonZero     uint64
-	clientQueue       [][]int16
+	clientJitter      *jitterBuffer
 	cellularSum       uint64
 	clientSum         uint64
 	cellularWindowAt  time.Time
@@ -64,14 +71,14 @@ func (b *Bridge) Start(ctx context.Context, callID modem.CallID) error {
 	b.callID = callID
 	b.clientFrameSeen = false
 	b.cellularFrameSeen = false
-	b.clientQueue = nil
+	b.clientJitter = newJitterBuffer()
 	b.clientFrames, b.cellularFrames = 0, 0
 	b.clientPeakMax, b.cellularPeakMax = 0, 0
 	b.clientNonZero, b.cellularNonZero = 0, 0
 	b.clientSum, b.cellularSum = 0, 0
 	b.clientWindowAt, b.cellularWindowAt = time.Now(), time.Now()
 	b.mu.Unlock()
-	b.media.OnPCMUFrame(func(frame []byte) {
+	onFrame := func(seq uint16, frame []byte) {
 		if len(frame) != FrameSamples {
 			slog.Warn("voice client frame dropped", "call_id", callID, "samples", len(frame))
 			return
@@ -117,38 +124,38 @@ func (b *Bridge) Start(ctx context.Context, callID modem.CallID) error {
 		// Without this, iPhone RTP bursts/stalls propagate through the
 		// UAC ADAPTIVE playback clock and choke the ASYNC capture side
 		// (observed: 50-frame windows taking 3-7s, then burst refills).
-		b.enqueueClient(pcm)
-	})
+		b.enqueueClient(seq, pcm)
+	}
+	if sequenced, ok := b.media.(SequencedPCMUTransport); ok {
+		sequenced.OnSequencedPCMUFrame(onFrame)
+	} else {
+		var arrival uint16
+		b.media.OnPCMUFrame(func(frame []byte) {
+			onFrame(arrival, frame)
+			arrival++
+		})
+	}
 	go b.readLoop(ctx, callID)
 	go b.clientPlaybackLoop(ctx, callID)
 	return nil
 }
 
-// clientQueue holds decoded upstream frames between the RTP callback and
-// the fixed-rate playback ticker. Capacity is deliberate: keep at least
-// 3 frames so a 60ms network stall never starves aplay, and drop the
-// oldest frame when full so end-to-end latency cannot grow unbounded.
-const (
-	clientQueueSize  = 5   // 100ms @ 20ms — absorbs Wi-Fi jitter without audible lag
-	voiceStatsFrames = 250 // Five-second diagnostic windows, not per-second log traffic.
-)
+const voiceStatsFrames = 250 // Five-second diagnostic windows, not per-second log traffic.
 
-func (b *Bridge) enqueueClient(pcm []int16) {
+// enqueueClient hands a decoded upstream frame to the sequence-ordered
+// jitter buffer between the RTP callback and the fixed-rate playback ticker
+// (see jitter.go for prefill, concealment and the latency ceiling).
+func (b *Bridge) enqueueClient(seq uint16, pcm []int16) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if len(b.clientQueue) >= clientQueueSize {
-		// drop oldest to bound latency
-		copy(b.clientQueue, b.clientQueue[1:])
-		b.clientQueue = b.clientQueue[:len(b.clientQueue)-1]
+	if b.clientJitter != nil {
+		b.clientJitter.push(seq, pcm)
 	}
-	frame := make([]int16, len(pcm))
-	copy(frame, pcm)
-	b.clientQueue = append(b.clientQueue, frame)
 }
 
-// clientPlaybackLoop drains the jitter queue at a fixed 20ms cadence,
-// writing silence when the queue is empty (keeps UAC playback RUNNING
-// and the full-duplex clock moving — no XRUN, no capture stall).
+// clientPlaybackLoop drains the jitter buffer at a fixed 20ms cadence,
+// writing concealment or silence when no frame is due (keeps UAC playback
+// RUNNING and the full-duplex clock moving — no XRUN, no capture stall).
 func (b *Bridge) clientPlaybackLoop(ctx context.Context, callID modem.CallID) {
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
@@ -163,15 +170,8 @@ func (b *Bridge) clientPlaybackLoop(ctx context.Context, callID modem.CallID) {
 				b.mu.Unlock()
 				return
 			}
-			var frame []int16
-			if len(b.clientQueue) > 0 {
-				frame = b.clientQueue[0]
-				b.clientQueue = b.clientQueue[1:]
-			}
+			frame := b.clientJitter.pop(silence)
 			b.mu.Unlock()
-			if frame == nil {
-				frame = silence
-			}
 			if err := b.writePCM(frame); err != nil {
 				slog.Warn("voice modem playback failed", "call_id", callID, "error", err)
 			}
@@ -294,9 +294,20 @@ func (b *Bridge) Stop(ctx context.Context) error {
 		b.started = false
 		callID := b.callID
 		b.callID = ""
+		var uplink jitterStats
+		if b.clientJitter != nil {
+			uplink = b.clientJitter.stats
+		}
 		b.mu.Unlock()
 		if started {
-			slog.Info("voice bridge stopping", "call_id", callID)
+			// Uplink (phone → cellular) summary for "the other side hears me
+			// choppy": lost = RTP gaps, late/duplicate = reordering on the
+			// path, underruns = the phone's stream stalled.
+			slog.Info("voice bridge stopping", "call_id", callID,
+				"uplink_received", uplink.Received, "uplink_lost", uplink.Lost,
+				"uplink_late", uplink.Late, "uplink_duplicate", uplink.Duplicate,
+				"uplink_concealed", uplink.Concealed, "uplink_underruns", uplink.Underruns,
+				"uplink_overflowed", uplink.Overflowed, "uplink_resets", uplink.Resets)
 		}
 		if started {
 			_ = b.audio.Stop(ctx)

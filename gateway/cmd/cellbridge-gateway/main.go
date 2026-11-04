@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -33,6 +35,13 @@ import (
 )
 
 func main() {
+	os.Exit(run())
+}
+
+// run returns the process exit code. It is split from main so deferred
+// cleanup (SIP BYE, audio close, database close) still runs on a non-zero
+// exit; os.Exit in main would otherwise skip every defer.
+func run() int {
 	configPath := flag.String("config", "", "YAML configuration path")
 	listen := flag.String("listen", "", "control-plane listen address override")
 	id := flag.String("gateway-id", "gw-dev", "gateway identifier")
@@ -44,7 +53,7 @@ func main() {
 	var level slog.Level
 	if err := level.UnmarshalText([]byte(*logLevel)); err != nil {
 		fmt.Fprintln(os.Stderr, "invalid log level:", err)
-		os.Exit(1)
+		return 1
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 	settings := config.Default()
@@ -52,7 +61,7 @@ func main() {
 		loaded, err := config.Load(*configPath)
 		if err != nil {
 			slog.Error("load configuration", "error", err)
-			os.Exit(1)
+			return 1
 		}
 		settings = loaded
 	}
@@ -64,26 +73,26 @@ func main() {
 	}
 	if err := settings.Validate(); err != nil {
 		slog.Error("invalid configuration", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	turnTTL, err := time.ParseDuration(settings.WebRTC.TurnCredentialTTL)
 	if err != nil || turnTTL <= 0 {
 		slog.Error("invalid TURN credential TTL", "value", settings.WebRTC.TurnCredentialTTL)
-		os.Exit(1)
+		return 1
 	}
 	if err := os.MkdirAll(settings.Data.Dir, 0o750); err != nil {
 		slog.Error("create data directory", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	database, err := db.Open(filepath.Join(settings.Data.Dir, "cellbridge.sqlite"))
 	if err != nil {
 		slog.Error("open database", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	defer database.Close()
 	if err := database.Migrate(context.Background()); err != nil {
 		slog.Error("migrate database", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	if err := database.EnsureRecordingSettings(context.Background(), db.RecordingSettings{
 		Enabled:          settings.Recording.Enabled,
@@ -92,7 +101,7 @@ func main() {
 		MinimumFreeBytes: settings.Recording.MinimumFreeBytes,
 	}); err != nil {
 		slog.Error("initialize recording settings", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	authentication := auth.NewService(*id, database)
 	application := api.NewServer(*id, *name, *version)
@@ -138,7 +147,7 @@ func main() {
 		recorder, recordingErr := recording.NewManager(database, filepath.Join(settings.Data.Dir, "recordings"), settings.Recording.RetentionDays)
 		if recordingErr != nil {
 			slog.Error("initialize recording service", "error", recordingErr)
-			os.Exit(1)
+			return 1
 		}
 		recorder.SetMinimumFreeBytes(settings.Recording.MinimumFreeBytes)
 		recorder.SetEventHandler(func(kind string, item db.Recording) {
@@ -160,7 +169,7 @@ func main() {
 			slog.Warn("no usable modem found; gateway will run without cellular I/O", "error", serialErr)
 		} else {
 			slog.Error("open configured modem", "error", serialErr)
-			os.Exit(1)
+			return 1
 		}
 	}
 	if serialAdapter != nil {
@@ -304,7 +313,18 @@ func main() {
 		}
 		cancel()
 		go func() {
-			if runErr := serialAdapter.Run(shutdownContext); runErr != nil && runErr != context.Canceled {
+			runErr := serialAdapter.Run(shutdownContext)
+			if errors.Is(runErr, at.ErrPortLost) {
+				// The open fd belongs to a USB device that is gone; nothing in
+				// this process can recover it. Exit non-zero so procd respawns
+				// run-staging.sh, which waits for the module, rebuilds the voice
+				// route and reopens the new /dev/ttyUSB2.
+				slog.Error("modem serial port lost; restarting gateway", "tty", settings.Modem.TTY, "error", runErr)
+				modemLost.Store(true)
+				stop()
+				return
+			}
+			if runErr != nil && runErr != context.Canceled {
 				slog.Warn("modem URC reader stopped", "error", runErr)
 			}
 		}()
@@ -369,9 +389,16 @@ func main() {
 	slog.Info("cellbridge gateway listening", "address", settings.Server.Listen, "gateway_id", *id)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		slog.Error("gateway stopped", "error", err)
-		os.Exit(1)
+		return 1
 	}
+	if modemLost.Load() {
+		return 1
+	}
+	return 0
 }
+
+// modemLost is set when the serial reader reports the USB device vanished.
+var modemLost atomic.Bool
 
 func recordingEventPayload(item db.Recording) map[string]any {
 	value := map[string]any{"id": item.ID, "callId": item.CallID, "state": item.State}
@@ -384,13 +411,19 @@ func recordingEventPayload(item db.Recording) map[string]any {
 	return value
 }
 
-// thermalMonitor logs the cellular module's internal temperature every 30s
+// thermalMonitor reads the cellular module's internal temperature every 30s
 // and warns when it runs hot. A 24/7 gateway in a closed enclosure cooks the
 // module; catching it early avoids RF throttling and dropped calls. It only
 // reads AT (no throttling of its own) so it never adds to the heat it watches.
+//
+// Normal readings are logged at INFO only when they move by
+// thermalLogDelta or once per thermalLogEvery. Logging all 2880 samples a day
+// filled OpenWrt's small logread ring within hours and pushed the SIP/call
+// lines needed for troubleshooting out of the buffer.
 func thermalMonitor(ctx context.Context, m *at.Adapter) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
+	var throttle thermalLogThrottle
 	read := func() {
 		c, src, err := m.Temperature(ctx)
 		if err != nil {
@@ -398,10 +431,12 @@ func thermalMonitor(ctx context.Context, m *at.Adapter) {
 			return
 		}
 		fields := []any{"temp_c", c, "source", src}
-		if c >= 60 {
+		if c >= thermalHighC {
 			slog.Warn("modem temperature HIGH — 考虑提高 CELLBRIDGE_SMS_POLL_INTERVAL 或改善散热", fields...)
-		} else {
+		} else if throttle.shouldLog(c, time.Now()) {
 			slog.Info("modem temperature", fields...)
+		} else {
+			slog.Debug("modem temperature", fields...)
 		}
 	}
 	read()
@@ -448,4 +483,24 @@ func openConfiguredModem(configuredPath string, baud int) (*at.Adapter, error) {
 		failures = append(failures, fmt.Sprintf("%s: %v", path, err))
 	}
 	return nil, fmt.Errorf("no usable modem found: %s", strings.Join(failures, "; "))
+}
+
+const (
+	thermalHighC    = 60
+	thermalLogDelta = 3.0
+	thermalLogEvery = time.Hour
+)
+
+type thermalLogThrottle struct {
+	logged bool
+	lastC  float64
+	lastAt time.Time
+}
+
+func (t *thermalLogThrottle) shouldLog(c float64, now time.Time) bool {
+	if t.logged && now.Sub(t.lastAt) < thermalLogEvery && c-t.lastC < thermalLogDelta && t.lastC-c < thermalLogDelta {
+		return false
+	}
+	t.logged, t.lastC, t.lastAt = true, c, now
+	return true
 }

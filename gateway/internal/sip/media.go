@@ -89,6 +89,12 @@ func (m *MediaSession) WritePCMU(frame []byte) error {
 }
 
 func (m *MediaSession) OnPCMUFrame(fn func([]byte)) {
+	m.OnSequencedPCMUFrame(func(_ uint16, frame []byte) { fn(frame) })
+}
+
+// OnSequencedPCMUFrame delivers each accepted PCMU payload with its RTP
+// sequence number so the voice bridge can reorder and de-duplicate.
+func (m *MediaSession) OnSequencedPCMUFrame(fn func(seq uint16, frame []byte)) {
 	go func() {
 		buf := make([]byte, 2048)
 		for {
@@ -116,7 +122,7 @@ func (m *MediaSession) OnPCMUFrame(fn func([]byte)) {
 			}
 			m.rx++
 			m.mu.Unlock()
-			fn(pkt.Payload)
+			fn(pkt.SequenceNumber, pkt.Payload)
 		}
 	}()
 }

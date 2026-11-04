@@ -32,4 +32,7 @@ if command -v tailscale >/dev/null; then
     echo 'Local Tailscale IPv4:'
     tailscale ip -4 || true
 fi
+if command -v logread >/dev/null; then
+    echo "USB serial loss restarts in system log: $(logread 2>/dev/null | grep -c 'modem serial port lost')"
+fi
 echo 'Health OK is not a proof of current USB voice or lock-screen push readiness.'
