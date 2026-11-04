@@ -1,8 +1,10 @@
 package sip
 
 import (
+	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/cellbridge/cellbridge/gateway/internal/voice"
 	"github.com/pion/rtp"
@@ -94,7 +96,16 @@ func (m *MediaSession) OnPCMUFrame(fn func([]byte)) {
 
 // OnSequencedPCMUFrame delivers each accepted PCMU payload with its RTP
 // sequence number so the voice bridge can reorder and de-duplicate.
+//
+// RTP that queued in the socket before the reader started is discarded
+// first. The phone starts sending the moment it answers, but the bridge only
+// starts after the modem has picked up the cellular leg (~2.3 s later); those
+// ~115 stale frames then hit the jitter buffer in one burst, ~100 overflowed
+// and the rest added 300 ms of delay at the start of every call (2026-11-04).
 func (m *MediaSession) OnSequencedPCMUFrame(fn func(seq uint16, frame []byte)) {
+	if stale := m.discardQueued(); stale > 0 {
+		slog.Info("rtp stale packets discarded", "local", m.LocalAddr().String(), "packets", stale)
+	}
 	go func() {
 		buf := make([]byte, 2048)
 		for {
@@ -125,6 +136,25 @@ func (m *MediaSession) OnSequencedPCMUFrame(fn func(seq uint16, frame []byte)) {
 			fn(pkt.SequenceNumber, pkt.Payload)
 		}
 	}()
+}
+
+// discardQueued drops every datagram already waiting on the socket.
+func (m *MediaSession) discardQueued() int {
+	buf := make([]byte, 2048)
+	count := 0
+	for {
+		// A deadline already in the past fails before reading anything, so
+		// give each read a 1 ms window: queued datagrams return at once.
+		if err := m.conn.SetReadDeadline(time.Now().Add(time.Millisecond)); err != nil {
+			return count
+		}
+		if _, _, err := m.conn.ReadFromUDP(buf); err != nil {
+			break
+		}
+		count++
+	}
+	_ = m.conn.SetReadDeadline(time.Time{})
+	return count
 }
 
 // Stats reports RTP counters for §36/§37 audio diagnostics.

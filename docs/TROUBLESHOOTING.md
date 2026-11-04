@@ -22,9 +22,9 @@ SIP 5060 可达不意味着动态 RTP UDP 端口也可达。不要只开放一�
 
 Wi-Fi 正常而某个蜂窝连接卡顿时，做单变量对照：同一手机换运营商、同一 SIM 换手机、或连接另一运营商的外网热点。一次同时换手机和 SIM 的改善不能单独证明运营商或手机哪一方有问题。VPN 也不能恢复在上游已经丢失的语音。
 
-当前接收端只接受 RTP PT=0、160 字节载荷。上行有按序号排序的固定抖动缓冲（预缓冲 2 帧 / 40 ms，上限 6 帧 / 120 ms）和简单丢包补偿（上一帧 1/2、1/4 增益，之后静音），不是自适应缓冲，网络质量差时仍会卡顿。
+当前接收端只接受 RTP PT=0、160 字节载荷。上行有按序号排序的抖动缓冲（预缓冲 2 帧 / 40 ms，突发上限 15 帧 / 300 ms；队列超过 80 ms 时在静音帧里逐帧排空）和简单丢包补偿（上一帧 1/2、1/4 增益，之后静音），不是自适应缓冲，网络质量差时仍会卡顿。
 
-每通电话结束时，`voice bridge stopping` 一行会带上行统计：`uplink_lost`（序号缺口）、`uplink_late` / `uplink_duplicate`（乱序/重复）、`uplink_underruns`（手机流中断、缓冲取空）、`uplink_overflowed`（突发超过上限被丢弃）。`uplink_lost` 高说明路上丢包；`uplink_underruns` 高而 `uplink_lost` 低，说明包是成批晚到。
+每通电话结束时，`voice bridge stopping` 一行会带上行统计：`uplink_lost`（序号缺口）、`uplink_late` / `uplink_duplicate`（乱序/重复）、`uplink_underruns`（手机流中断、缓冲取空）、`uplink_overflowed`（突发超过 300 ms 上限被丢弃）、`uplink_drained`（为降低延迟跳过的静音帧，正常）。`uplink_lost` 高说明路上丢包；`uplink_underruns` 高而 `uplink_lost` 低，说明包是成批晚到。
 
 ## 通话结束或看似突然挂断
 
@@ -37,6 +37,18 @@ Wi-Fi 正常而某个蜂窝连接卡顿时，做单变量对照：同一手机�
 模块温度只在变化 ≥3 °C 或每小时记录一次（≥60 °C 每次告警），不再每 30 秒刷屏，系统日志能保留更久的通话记录。
 
 procd 输出可能全标为 `daemon.err`，但应用字段 `level=INFO` 仍是信息日志；不要把标签当成故障。
+
+## 通话中自己的声音一断一断（麦克风像被间歇静音）
+
+先看通话结束时的 `voice bridge stopping`：
+
+- `uplink_overflowed` 很高：网关丢掉了成批晚到的语音。v1.1.1 起上限为 300 ms，正常情况下应接近 0。
+- `uplink_lost` 很高：网络上真的丢了包（常见于手机走蜂窝流量 + VPN），网关补不回来。
+- 两者都低，但 `voice client stats` 的 `nonzero` 在对方说话时很低（远小于 250）：说明手机发来的就是数字静音。这是手机端回声消除/降噪在对方说话时压低麦克风，属于手机侧行为。对方声音越大、削顶越严重（`voice cellular stats` 的 `peak_max` 接近 32767），压得越明显。可以试试降低手机通话音量、改用耳机，或在 YakPhone 里调整回声消除/降噪设置做对照。
+
+## 点静音后麦克风自己开开关关 / 通话中改状态没反应
+
+在客户端 SIP 日志里找接通后的 `TX INVITE`（re-INVITE）及其响应。v1.1.1 起网关日志会有 `sip in-dialog offer answered`；如果客户端只收到 `180` 而没有 `200`，或挂断时出现对这个 re-INVITE 的 `CANCEL`，说明网关版本过旧。
 
 ## 后台 / 锁屏不响
 

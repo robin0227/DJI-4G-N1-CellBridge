@@ -42,8 +42,8 @@ func TestRingClientsSendsInviteToRegisteredClient(t *testing.T) {
 	}
 	msg := string(buf[:n])
 	requestLine := strings.SplitN(msg, "\r\n", 2)[0]
-	if !strings.HasPrefix(requestLine, "INVITE sip:iphone@") {
-		t.Errorf("unexpected request line: %q", requestLine)
+	if want := fmt.Sprintf("INVITE sip:iphone@%s SIP/2.0", clientAddr.String()); requestLine != want {
+		t.Errorf("request line = %q, want %q", requestLine, want)
 	}
 	if !strings.Contains(msg, "Call-ID: in-test-call-0001") {
 		t.Errorf("missing Call-ID in %q", msg)
@@ -92,5 +92,42 @@ func TestRingClientsDeduplicatesRepeatRings(t *testing.T) {
 	}
 	if count != 1 {
 		t.Errorf("got %d INVITEs for one incoming call, want 1", count)
+	}
+}
+
+// YakPhone registers a per-instance contact user and rejects an INVITE whose
+// Request-URI names only the account (404 → the caller hears "busy").
+func TestRingClientsAddressesRegisteredContact(t *testing.T) {
+	clientConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientConn.Close()
+	clientAddr := clientConn.LocalAddr().(*net.UDPAddr)
+	gwConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gwConn.Close()
+
+	reg := NewRegistrar()
+	// The phone advertises its private address; the packet arrives via NAT.
+	contact := "<sip:iphone-2YbUkOF3XmCJSoS@192.168.10.137:55186>;expires=300"
+	reg.RegisterFrom("iphone", contact, "UDP", 300, clientAddr)
+	s := &Server{conn: gwConn, registrar: reg, ctx: context.Background()}
+	s.ringClients(modem.ModemEvent{Kind: "incoming", CallID: modem.CallID("contact-call-01"), Peer: "10086"})
+
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 4096)
+	n, _, err := clientConn.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("no INVITE received at the NAT source address: %v", err)
+	}
+	msg := string(buf[:n])
+	if requestLine := strings.SplitN(msg, "\r\n", 2)[0]; requestLine != "INVITE sip:iphone-2YbUkOF3XmCJSoS@192.168.10.137:55186 SIP/2.0" {
+		t.Errorf("request line = %q, want the registered contact", requestLine)
+	}
+	if !strings.Contains(msg, "\r\nTo: <sip:iphone@") {
+		t.Errorf("To header must stay the account address of record in %q", msg)
 	}
 }

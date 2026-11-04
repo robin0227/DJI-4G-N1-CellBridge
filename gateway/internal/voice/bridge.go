@@ -47,6 +47,10 @@ type Bridge struct {
 	cellularWindowAt  time.Time
 	clientWindowAt    time.Time
 	mu                sync.Mutex
+	// writeMu serialises modem playback writes with Stop. It is separate from
+	// mu so a write blocked on aplay never stalls the RTP receive callback,
+	// which used to hold back packets and release them as artificial bursts.
+	writeMu sync.Mutex
 }
 
 func NewBridge(audio modem.VoiceAudio, media PCMUTransport) *Bridge {
@@ -156,28 +160,53 @@ func (b *Bridge) enqueueClient(seq uint16, pcm []int16) {
 // clientPlaybackLoop drains the jitter buffer at a fixed 20ms cadence,
 // writing concealment or silence when no frame is due (keeps UAC playback
 // RUNNING and the full-duplex clock moving — no XRUN, no capture stall).
+//
+// Frames are paced against an absolute schedule (start + n·20 ms), not a
+// time.Ticker. A ticker silently drops ticks whenever a write to aplay blocks
+// past the next one, so playback ran ~3-4 % slower than the phone's 50 fps
+// stream and the jitter buffer overflowed ~100 frames per call (2026-11-04).
+// Missed slots are now caught up; after a long stall the schedule is reset
+// instead of bursting audio into the modem.
 func (b *Bridge) clientPlaybackLoop(ctx context.Context, callID modem.CallID) {
-	ticker := time.NewTicker(20 * time.Millisecond)
-	defer ticker.Stop()
 	silence := make([]int16, FrameSamples)
+	start := time.Now()
+	var played int64
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	<-timer.C
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			b.mu.Lock()
-			if !b.started {
-				b.mu.Unlock()
+		due := start.Add(time.Duration(played+1) * frameInterval)
+		if wait := time.Until(due); wait > 0 {
+			timer.Reset(wait)
+			select {
+			case <-ctx.Done():
 				return
+			case <-timer.C:
 			}
-			frame := b.clientJitter.pop(silence)
-			b.mu.Unlock()
-			if err := b.writePCM(frame); err != nil {
-				slog.Warn("voice modem playback failed", "call_id", callID, "error", err)
-			}
+		} else if -wait > playbackResync {
+			start, played = time.Now(), 0
 		}
+		if ctx.Err() != nil {
+			return
+		}
+		b.mu.Lock()
+		if !b.started {
+			b.mu.Unlock()
+			return
+		}
+		frame := b.clientJitter.pop(silence)
+		b.mu.Unlock()
+		if err := b.writePCM(frame); err != nil {
+			slog.Warn("voice modem playback failed", "call_id", callID, "error", err)
+		}
+		played++
 	}
 }
+
+const (
+	frameInterval  = time.Duration(FrameMillis) * time.Millisecond
+	playbackResync = 200 * time.Millisecond
+)
 
 func (b *Bridge) readLoop(ctx context.Context, callID modem.CallID) {
 	pcm := make([]int16, FrameSamples)
@@ -264,9 +293,9 @@ func (b *Bridge) writePCM(pcm []int16) error {
 	// Keep the started check and the write serialized with Stop. Otherwise the
 	// media callback can enter ALSA after Stop has closed the device and emit a
 	// misleading "audio is not active" error during normal call teardown.
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if !b.started {
+	b.writeMu.Lock()
+	defer b.writeMu.Unlock()
+	if !b.isStarted() {
 		return nil
 	}
 	_, err := b.audio.WritePCM(pcm)
@@ -307,10 +336,14 @@ func (b *Bridge) Stop(ctx context.Context) error {
 				"uplink_received", uplink.Received, "uplink_lost", uplink.Lost,
 				"uplink_late", uplink.Late, "uplink_duplicate", uplink.Duplicate,
 				"uplink_concealed", uplink.Concealed, "uplink_underruns", uplink.Underruns,
-				"uplink_overflowed", uplink.Overflowed, "uplink_resets", uplink.Resets)
+				"uplink_overflowed", uplink.Overflowed, "uplink_drained", uplink.Drained,
+				"uplink_resets", uplink.Resets)
 		}
 		if started {
+			// Wait for an in-flight playback write before stopping the device.
+			b.writeMu.Lock()
 			_ = b.audio.Stop(ctx)
+			b.writeMu.Unlock()
 		}
 	})
 	return nil

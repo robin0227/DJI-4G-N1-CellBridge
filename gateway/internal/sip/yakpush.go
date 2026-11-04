@@ -30,7 +30,11 @@ var yakHTTPClient = &http.Client{
 // sendYakPush fires the official YakPhone PushKit notification
 // (push.yakteam.com/v1/notify) so the phone wakes for an incoming SIP
 // call / missed call / SIP message even when YakPhone is suspended.
-func (s *Server) sendYakPush(callerURI, pushType, messageBody string) {
+//
+// callID is the SIP Call-ID of the INVITE for this call. YakPhone uses it to
+// recognise that the push-woken CallKit call and the direct INVITE are the
+// same call; without it the two could be treated as separate calls.
+func (s *Server) sendYakPush(callerURI, pushType, messageBody, callID string) {
 	if s.pushToken == "" {
 		slog.Warn("yakpush skipped", "reason", "no push token configured", "type", pushType)
 		return
@@ -43,6 +47,9 @@ func (s *Server) sendYakPush(callerURI, pushType, messageBody string) {
 	}
 	if messageBody != "" {
 		body["message_body"] = messageBody
+	}
+	if callID != "" {
+		body["call_id"] = callID
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {

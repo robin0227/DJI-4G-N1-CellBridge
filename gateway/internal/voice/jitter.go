@@ -13,8 +13,13 @@ package voice
 //   - drops duplicates and frames that arrive after their slot was played;
 //   - conceals a missing frame by replaying the last good one at falling gain
 //     (two frames at most, then silence) instead of inserting a click;
-//   - caps queued audio at jitterMax frames (120 ms) so clock drift or a burst
-//     after a stall cannot grow the mouth-to-ear delay without bound.
+//   - absorbs bursts of up to jitterMax frames (300 ms). iPhone Wi-Fi power
+//     saving delivers uplink RTP in clumps; a 120 ms ceiling dropped 172
+//     frames (3.4 s of the user's voice) in one 85 s call on 2026-11-04,
+//     heard as the microphone cutting in and out;
+//   - drains the extra delay a burst leaves behind by skipping one quiet frame
+//     at a time (inaudible), and only skips speech if the queue has stayed
+//     deep for drainForce ticks.
 //
 // It is not safe for concurrent use; Bridge guards it with its mutex.
 type jitterBuffer struct {
@@ -24,6 +29,7 @@ type jitterBuffer struct {
 	buffering bool
 	last      []int16
 	concealed int
+	deepTicks int
 	stats     jitterStats
 }
 
@@ -35,14 +41,19 @@ type jitterStats struct {
 	Concealed  uint64
 	Underruns  uint64
 	Overflowed uint64
+	Drained    uint64
 	Resets     uint64
 }
 
 const (
-	jitterTarget = 2  // 40 ms of prefill
-	jitterMax    = 6  // 120 ms latency ceiling
-	jitterReset  = 50 // a sequence jump of 1 s or more means a new stream
-	jitterFade   = 2  // concealment frames before falling silent
+	jitterTarget = 2   // 40 ms of prefill
+	jitterMax    = 15  // 300 ms hard ceiling for bursts
+	jitterDeep   = 4   // queue depth (80 ms) above which delay is drained
+	drainQuiet   = 10  // deep ticks before a quiet frame may be skipped
+	drainForce   = 100 // deep ticks (2 s) before any frame is skipped
+	quietPeak    = 500 // |sample| below this counts as a pause in speech
+	jitterReset  = 50  // a sequence jump of 1 s or more means a new stream
+	jitterFade   = 2   // concealment frames before falling silent
 )
 
 func newJitterBuffer() *jitterBuffer {
@@ -106,6 +117,13 @@ func (j *jitterBuffer) pop(silence []int16) []int16 {
 	if frame, ok := j.frames[j.next]; ok {
 		delete(j.frames, j.next)
 		j.next++
+		if j.drain(frame) {
+			if next, ok := j.frames[j.next]; ok {
+				delete(j.frames, j.next)
+				j.next++
+				frame = next
+			}
+		}
 		j.last = frame
 		j.concealed = 0
 		return frame
@@ -124,6 +142,22 @@ func (j *jitterBuffer) pop(silence []int16) []int16 {
 	j.stats.Lost++
 	j.next++
 	return j.conceal(silence)
+}
+
+// drain reports whether the frame just taken should be skipped to shorten a
+// queue that a burst left deeper than needed. It is called once per tick.
+func (j *jitterBuffer) drain(frame []int16) bool {
+	if len(j.frames) < jitterDeep {
+		j.deepTicks = 0
+		return false
+	}
+	j.deepTicks++
+	if (j.deepTicks >= drainQuiet && pcmPeak(frame) < quietPeak) || j.deepTicks >= drainForce {
+		j.deepTicks = 0
+		j.stats.Drained++
+		return true
+	}
+	return false
 }
 
 func (j *jitterBuffer) conceal(silence []int16) []int16 {

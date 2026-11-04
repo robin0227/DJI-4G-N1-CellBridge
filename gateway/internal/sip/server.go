@@ -401,7 +401,14 @@ func (s *Server) ringClients(event modem.ModemEvent) {
 			}
 			inviteSDP := fmt.Sprintf("v=0\r\no=cellbridge 0 0 IN IP4 %s\r\ns=CellBridge\r\nc=IN IP4 %s\r\nt=0 0\r\nm=audio %d RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n", local, local, media.LocalAddr().Port)
 			callerHdrs, callerFrom := inboundCallerHeaders(peer, local)
-			invite := fmt.Sprintf("INVITE sip:%s@%s SIP/2.0\r\nVia: SIP/2.0/UDP %s:5060;branch=%s;rport\r\nFrom: %s;tag=cb%s\r\nTo: <sip:%s@%s>\r\nCall-ID: %s\r\nCSeq: 1 INVITE\r\nContact: <sip:cellbridge@%s:5060>\r\nMax-Forwards: 70\r\n%sContent-Type: application/sdp\r\nContent-Length: %d\r\n\r\n%s", reg.Username, local, local, branch, callerFrom, shortID, reg.Username, local, callID, local, callerHdrs, len(inviteSDP), inviteSDP)
+			// The Request-URI must be the Contact the client registered
+			// (RFC 3261 §10.3), not sip:<account>@<gateway>. YakPhone now
+			// registers a per-instance contact such as sip:iphone-2YbUk…@…
+			// and answers any other Request-URI with 404 Not Found; the
+			// gateway then released the cellular leg and the caller heard
+			// "busy" right after the phone picked up (2026-11-04).
+			reqURI := contactURI(reg.Contact, remote, reg.Username)
+			invite := fmt.Sprintf("INVITE %s SIP/2.0\r\nVia: SIP/2.0/UDP %s:5060;branch=%s;rport\r\nFrom: %s;tag=cb%s\r\nTo: <sip:%s@%s>\r\nCall-ID: %s\r\nCSeq: 1 INVITE\r\nContact: <sip:cellbridge@%s:5060>\r\nMax-Forwards: 70\r\n%sContent-Type: application/sdp\r\nContent-Length: %d\r\n\r\n%s", reqURI, local, branch, callerFrom, shortID, reg.Username, local, callID, local, callerHdrs, len(inviteSDP), inviteSDP)
 			// Claim the address before sending it: a duplicate INVITE to the
 			// same contact rings the phone again instead of fixing anything.
 			if !sess.RememberInvite(inviteAttempt{addr: remote, req: invite}) {
@@ -417,7 +424,7 @@ func (s *Server) ringClients(event modem.ModemEvent) {
 			// invited wins; V1 runs a single phone.
 			sess.SetByePlan(byePlan{
 				remote:       remote,
-				reqURI:       contactURI(reg.Contact, remote, reg.Username),
+				reqURI:       reqURI,
 				from:         fmt.Sprintf("%s;tag=cb%s", callerFrom, shortID),
 				to:           fmt.Sprintf("<sip:%s@%s>", reg.Username, local),
 				callID:       callID,
@@ -449,7 +456,7 @@ func (s *Server) ringClients(event modem.ModemEvent) {
 	if reachable == "" {
 		reachable = s.outboundIP()
 	}
-	s.sendYakPush("sip:"+peer+"@"+reachable, "voip", "")
+	s.sendYakPush("sip:"+peer+"@"+reachable, "voip", "", callID)
 	slog.Info("sip inbound ringing", "call_id", callID, "peer", peer, "invites_sent", sent, "push_host", reachable)
 	// Nobody picked up: release the cellular leg so the modem is not left
 	// ringing forever (which would make every later dial fail with
@@ -580,7 +587,22 @@ func (s *Server) handleMessage(msg string, remote *net.UDPAddr) {
 		return
 	}
 	if strings.HasPrefix(first, "INVITE") {
+		if s.answerInDialogOffer(msg, remote) {
+			return
+		}
 		s.handleInvite(msg, remote)
+		return
+	}
+	if strings.HasPrefix(first, "UPDATE") {
+		if !s.answerInDialogOffer(msg, remote) {
+			s.sendResponse(remote, msg, 481, "Call/Transaction Does Not Exist", "", "")
+		}
+		return
+	}
+	if strings.HasPrefix(first, "INFO") {
+		// SIP INFO DTMF / keepalive inside a call. The modem leg gets DTMF from
+		// RTP events; answering keeps the client from retransmitting for 32 s.
+		s.sendResponse(remote, msg, 200, "OK", "", "")
 		return
 	}
 	if strings.HasPrefix(first, "ACK") {
@@ -599,6 +621,67 @@ func (s *Server) handleMessage(msg string, remote *net.UDPAddr) {
 		s.handleMessageRequest(msg, remote)
 		return
 	}
+	// Anything else (SUBSCRIBE, NOTIFY, REFER, PRACK …) used to get no answer
+	// at all, leaving the client's transaction hanging until it timed out.
+	s.sendResponse(remote, msg, 501, "Not Implemented", "Allow: "+sipAllow+"\r\n", "")
+}
+
+const sipAllow = "INVITE, ACK, BYE, CANCEL, OPTIONS, MESSAGE, INFO, UPDATE"
+
+// answerInDialogOffer answers a re-INVITE or UPDATE inside an existing call
+// and reports whether msg was one. An in-dialog request carries the To tag
+// of the established dialog, which a retransmitted initial INVITE never does.
+//
+// YakPhone (baresip) sends a re-INVITE about 50 ms after every inbound call
+// connects. The INVITE handler mistook it for a retransmission of a call
+// still being set up and answered 180 Ringing with no final response, so the
+// client spent the whole call with an unfinished media negotiation — its
+// mute button then flipped on and off by itself (2026-11-04).
+func (s *Server) answerInDialogOffer(msg string, remote *net.UDPAddr) bool {
+	if !strings.Contains(parseHeader(msg, "To"), "tag=") {
+		return false
+	}
+	v, ok := s.sessions.Load(parseHeader(msg, "Call-ID"))
+	if !ok {
+		return false
+	}
+	sess := v.(*SIPCallSession)
+	if sess.media == nil {
+		return false
+	}
+	if current := sess.media.RemoteAddr(); current == nil || !current.IP.Equal(remote.IP) {
+		return false
+	}
+	offer := extractSDP(msg)
+	if target := inboundRTPTarget(remote, offer); target != "" {
+		if err := sess.media.SetRemote(target); err != nil {
+			slog.Warn("sip reinvite rtp target failed", "call", sess.ID, "err", err)
+		}
+	}
+	local := s.localIPFor(remote)
+	hdrs := "Contact: <sip:cellbridge@" + local + ":5060>\r\nAllow: " + sipAllow + "\r\n"
+	body := ""
+	if offer != "" {
+		hdrs += "Content-Type: application/sdp\r\n"
+		body = fmt.Sprintf("v=0\r\no=cellbridge 0 1 IN IP4 %s\r\ns=CellBridge\r\nc=IN IP4 %s\r\nt=0 0\r\nm=audio %d RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=%s\r\n", local, local, sess.media.LocalAddr().Port, sdpAnswerDirection(offer))
+	}
+	s.sendResponse(remote, msg, 200, "OK", hdrs, body)
+	method := strings.SplitN(msg, " ", 2)[0]
+	slog.Info("sip in-dialog offer answered", "call", sess.ID, "method", method, "cseq", parseHeader(msg, "CSeq"), "rtp_remote", sess.media.RemoteAddr())
+	return true
+}
+
+// sdpAnswerDirection mirrors the offer's media direction (RFC 3264 §6.1).
+func sdpAnswerDirection(offer string) string {
+	switch {
+	case strings.Contains(offer, "a=sendonly"):
+		return "recvonly"
+	case strings.Contains(offer, "a=recvonly"):
+		return "sendonly"
+	case strings.Contains(offer, "a=inactive"):
+		return "inactive"
+	}
+	return "sendrecv"
 }
 
 // handleResponse processes responses to gateway-originated INVITEs, i.e.

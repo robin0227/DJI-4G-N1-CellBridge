@@ -125,3 +125,57 @@ func TestJitterBufferHandlesWrapAndStreamReset(t *testing.T) {
 		t.Fatalf("resets = %d, want 1", j.stats.Resets)
 	}
 }
+
+func TestJitterBufferAbsorbsWiFiBurst(t *testing.T) {
+	j := newJitterBuffer()
+	j.push(0, jitterFrame(1000))
+	j.push(1, jitterFrame(1000))
+	popValues(j, 2)
+	// A 200 ms stall, then the ten held-back frames arrive at once.
+	popValues(j, 10)
+	for seq := uint16(2); seq < 12; seq++ {
+		j.push(seq, jitterFrame(1000))
+	}
+	if j.stats.Overflowed != 0 {
+		t.Fatalf("burst of 10 frames overflowed %d; voice was dropped", j.stats.Overflowed)
+	}
+}
+
+func TestJitterBufferDrainsDelayInPauses(t *testing.T) {
+	j := newJitterBuffer()
+	seq := uint16(0)
+	// Ten frames queued, then steady 1-in-1-out: the excess must shrink, and
+	// only during the quiet (pause) frames.
+	for ; seq < 10; seq++ {
+		j.push(seq, jitterFrame(0))
+	}
+	silence := make([]int16, FrameSamples)
+	for i := 0; i < 200; i++ {
+		j.push(seq, jitterFrame(0))
+		seq++
+		j.pop(silence)
+	}
+	if depth := len(j.frames); depth >= jitterDeep {
+		t.Fatalf("queue still %d frames deep after 4 s of pauses", depth)
+	}
+	if j.stats.Drained == 0 || j.stats.Overflowed != 0 {
+		t.Fatalf("stats = %+v, want drained frames and no overflow", j.stats)
+	}
+}
+
+func TestJitterBufferKeepsSpeechWhileDraining(t *testing.T) {
+	j := newJitterBuffer()
+	seq := uint16(0)
+	for ; seq < 8; seq++ {
+		j.push(seq, jitterFrame(8000))
+	}
+	silence := make([]int16, FrameSamples)
+	for i := 0; i < drainForce-1; i++ {
+		j.push(seq, jitterFrame(8000))
+		seq++
+		j.pop(silence)
+	}
+	if j.stats.Drained != 0 {
+		t.Fatalf("skipped %d speech frames before the force threshold", j.stats.Drained)
+	}
+}

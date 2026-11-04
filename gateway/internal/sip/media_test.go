@@ -78,3 +78,46 @@ func TestMediaSessionRejectsIPv6Remote(t *testing.T) {
 		t.Fatal("SetRemote accepted an IPv6 address for an IPv4 media socket")
 	}
 }
+
+// Packets the phone sent before the bridge started are stale and must not
+// reach the jitter buffer as one burst.
+func TestMediaDiscardsRTPQueuedBeforeReaderStarts(t *testing.T) {
+	m, err := NewMediaSession("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	client, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if err := m.SetRemote(client.LocalAddr().String()); err != nil {
+		t.Fatal(err)
+	}
+	send := func(seq uint16) {
+		packet := &rtp.Packet{Header: rtp.Header{Version: 2, PayloadType: 0, SequenceNumber: seq}, Payload: make([]byte, 160)}
+		data, err := packet.Marshal()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.WriteToUDP(data, m.LocalAddr()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for seq := uint16(1); seq <= 20; seq++ {
+		send(seq)
+	}
+	time.Sleep(20 * time.Millisecond)
+	got := make(chan uint16, 32)
+	m.OnSequencedPCMUFrame(func(seq uint16, _ []byte) { got <- seq })
+	send(21)
+	select {
+	case seq := <-got:
+		if seq != 21 {
+			t.Fatalf("first delivered seq = %d, want 21 (stale backlog leaked)", seq)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fresh packet not delivered after discarding backlog")
+	}
+}

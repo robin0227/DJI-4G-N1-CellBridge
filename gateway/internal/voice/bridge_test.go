@@ -160,3 +160,45 @@ func TestBridgeConvertsBothDirections(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// slowAudio blocks every fifth playback write past the next 20 ms slot, the
+// way aplay does when its small ALSA buffer is momentarily full.
+type slowAudio struct {
+	fakeAudio
+	writes int
+}
+
+func (a *slowAudio) ReadPCM(pcm []int16) (int, error) {
+	time.Sleep(20 * time.Millisecond)
+	return a.fakeAudio.ReadPCM(pcm)
+}
+
+func (a *slowAudio) WritePCM(pcm []int16) (int, error) {
+	a.mu.Lock()
+	a.writes++
+	slow := a.writes%5 == 0
+	a.mu.Unlock()
+	if slow {
+		time.Sleep(45 * time.Millisecond)
+	}
+	return len(pcm), nil
+}
+
+func TestBridgePlaybackKeepsFiftyFramesPerSecond(t *testing.T) {
+	audio := &slowAudio{fakeAudio: fakeAudio{maxFrames: 1 << 30}}
+	bridge := NewBridge(audio, &fakeMedia{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := bridge.Start(ctx, "pace"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Second)
+	_ = bridge.Stop(context.Background())
+	audio.mu.Lock()
+	writes := audio.writes
+	audio.mu.Unlock()
+	// A dropping ticker manages ~40 writes here; the schedule must keep ~50.
+	if writes < 47 {
+		t.Fatalf("%d playback writes in 1 s, want ~50", writes)
+	}
+}
