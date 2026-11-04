@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Fail closed on common secrets/private artifacts; report names, never matched values."""
 import argparse
+import hashlib
 from pathlib import Path
 import re
 import shlex
@@ -13,6 +14,11 @@ PATTERNS = (
     re.compile(rb'-----BEGIN (?:OPENSSH |RSA |EC |DSA )?PRIVATE KEY-----'),
     re.compile(rb'AKIA[0-9A-Z]{16}'),
 )
+# Binary files reviewed for publication, pinned by SHA-256 so a replaced or
+# newly added binary still fails the audit until it is reviewed again.
+REVIEWED_BINARIES = {
+    'docs/images/wechat-pay.png': 'f45e5c777bbc7a310f6258787406ae3bd8ce2929efa8c4287860476f7aff06be',  # README 赞赏码：仅二维码，无姓名、无 EXIF
+}
 PRIVATE_SUFFIXES = ('.sqlite', '.sqlite-wal', '.sqlite-shm', '.db', '.pem', '.key', '.ko', '.armv7', '.dylib', '.log')
 
 
@@ -55,7 +61,7 @@ def main():
         data = path.read_bytes()
         if any(pattern.search(data) for pattern in PATTERNS) or any(value in data for value in known):
             issues.append((str(relative), 'credential pattern or private comparison match'))
-        if b'\x00' in data:
+        if b'\x00' in data and REVIEWED_BINARIES.get(relative.as_posix()) != hashlib.sha256(data).hexdigest():
             issues.append((str(relative), 'unexpected binary file; review before release'))
     for name, reason in issues:
         print(name + ': ' + reason)

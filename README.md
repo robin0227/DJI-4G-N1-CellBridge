@@ -103,3 +103,9 @@ GitHub Actions 仅做检查、测试和 Linux ARM64 编译，不连接用户设�
 不要把 SIP/RTP 端口直接转发到公网。SIP 服务监听所有本地接口，**不等于 OpenWrt 防火墙已限制到 Tailscale**；必须按自己的网络检查 INPUT 规则和接口权限。Tailscale 隧道以外的 SIP/UDP 与 RTP 没有额外 TLS/SRTP 加密。
 
 提交前阅读 [安全说明](SECURITY.md) 与 [第三方声明](NOTICE)。源码 MIT 许可见 [LICENSE](LICENSE)；PyUSB 和其他依赖保留各自许可证。厂商二进制的许可不因本仓库开源而改变。
+
+## 赞赏支持
+
+如果这个项目帮你省了时间，欢迎扫码请作者喝杯咖啡。完全自愿，不影响任何功能的使用；收款人是本仓库作者个人，与 DJI、CellBridge / CellBridge-mac 上游作者无关。
+
+<img src="docs/images/wechat-pay.png" alt="微信赞赏码" width="220">
