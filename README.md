@@ -6,7 +6,7 @@
 
 ## 已验证范围
 
-2026-09-30 的实体部署：N1 / aarch64，OpenWrt 24.10.3、flippy 自定义内核 `6.18.12-flippy-94+`，USB ID `2c7c:0125`，ALSA 声卡 `EG25GQDC507`，Go 网关版本 `n1-20260930`。
+2026-09-30 的实体部署：N1 / aarch64，OpenWrt 24.10.3、flippy 自定义内核 `6.18.12-flippy-94+`，USB ID `2c7c:0125`，ALSA 声卡 `EG25GQDC507`，Go 网关版本 `n1-20260930`；2026-11-04 起运行 v1.1.0（`n1-20261104`），见 [更新日志](CHANGELOG.md)。
 
 - 前台 YakPhone 的拨出、来电接听和双向语音已实际使用。
 - SIP Digest 认证、来电事务处理、通话结束清理和长通话修复包含在完整 `gateway/` 源码中。
@@ -42,6 +42,7 @@ QDC507 / DJI 4G 模块 + SIM → VoLTE → 对方电话
 | `openwrt/vendor/usb/` | PyUSB 1.3.1 源码，保留 BSD 许可 |
 | `tools/` | 编译、依赖许可收集、发布前检查 |
 | `docs/` | 安装、安全、排障、已知限制和版本来源 |
+| `CHANGELOG.md` | 各版本更新说明 |
 
 ## 快速开始
 

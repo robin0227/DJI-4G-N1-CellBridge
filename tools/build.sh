@@ -23,6 +23,6 @@ PY
 tar -czf "$DIST/cellbridge-n1-openwrt.tar.gz" \
     --exclude='__pycache__' --exclude='*.pyc' --exclude='*.env' \
     --exclude='voice-runtime' --exclude='openwrt/run' --exclude='openwrt/data' --exclude='openwrt/logs' \
-    -C "$ROOT" openwrt LICENSE NOTICE docs README.md SECURITY.md \
+    -C "$ROOT" openwrt LICENSE NOTICE docs README.md SECURITY.md CHANGELOG.md \
     -C "$DIST" cellbridge-gateway-linux-arm64 SHA256SUMS licenses
 echo "Build ready: $DIST/cellbridge-n1-openwrt.tar.gz"
