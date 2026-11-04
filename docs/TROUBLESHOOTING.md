@@ -12,7 +12,7 @@ SIP 5060 可达不意味着动态 RTP UDP 端口也可达。不要只开放一�
 
 `/dev/ttyUSB2` 存在，不能证明服务仍握着当前那个设备。查看自己的 gateway PID 及其 `/proc/<pid>/fd/`；若串口链接标有 `(deleted)`，旧 FD 已失效，健康 API 仍可能正常。对照 sysfs 接口重新辨认 AT、备用 AT 和音频接口。
 
-当前版本没有完整的热插拔重发现。只在无通话时，确认具体模块 USB ID 和设备路径后，恢复该模块、再重启 CellBridge。不要无差别复位 USB 总线，不要重启整个 N1/Passwall/Tailscale。先保留旧配置以便回退。
+网关的空闲串口读取连续失败（EIO/ENODEV/挂断）约 200 ms 后会记录 `modem serial port lost; restarting gateway` 并以非零状态退出，procd 15 秒后重跑 runner。`doctor.sh` 会统计系统日志中的这类重启次数。如果反复出现，或串口编号已不是 `/dev/ttyUSB2`，自动重启无法解决，按下文人工处理。只在无通话时，确认具体模块 USB ID 和设备路径后，恢复该模块、再重启 CellBridge。不要无差别复位 USB 总线，不要重启整个 N1/Passwall/Tailscale。先保留旧配置以便回退。
 
 ## 自己听得清楚，对方听自己卡顿
 
@@ -22,7 +22,9 @@ SIP 5060 可达不意味着动态 RTP UDP 端口也可达。不要只开放一�
 
 Wi-Fi 正常而某个蜂窝连接卡顿时，做单变量对照：同一手机换运营商、同一 SIM 换手机、或连接另一运营商的外网热点。一次同时换手机和 SIM 的改善不能单独证明运营商或手机哪一方有问题。VPN 也不能恢复在上游已经丢失的语音。
 
-当前接收端主要接受 RTP PT=0、160 字节载荷。没有完善的自适应 jitter buffer、PLC 或乱序重排，网络质量差时可能有明显卡顿。不要声称该限制已修复。
+当前接收端只接受 RTP PT=0、160 字节载荷。上行有按序号排序的固定抖动缓冲（预缓冲 2 帧 / 40 ms，上限 6 帧 / 120 ms）和简单丢包补偿（上一帧 1/2、1/4 增益，之后静音），不是自适应缓冲，网络质量差时仍会卡顿。
+
+每通电话结束时，`voice bridge stopping` 一行会带上行统计：`uplink_lost`（序号缺口）、`uplink_late` / `uplink_duplicate`（乱序/重复）、`uplink_underruns`（手机流中断、缓冲取空）、`uplink_overflowed`（突发超过上限被丢弃）。`uplink_lost` 高说明路上丢包；`uplink_underruns` 高而 `uplink_lost` 低，说明包是成批晚到。
 
 ## 通话结束或看似突然挂断
 
@@ -31,6 +33,8 @@ Wi-Fi 正常而某个蜂窝连接卡顿时，做单变量对照：同一手机�
 - `sip bye received method=BYE`：客户端发起结束；可能是正常挂断、误触或 App/iOS 结束，网关日志不能证明用户点了哪个按钮。
 - `sip call ended by modem raw="NO CARRIER"`：模块先报告结束，网关再通知手机；仅凭这一行不能区分对方挂断、蜂窝网络释放或模块问题。
 - `sip await bridge failed` / `sip inbound ring timeout`：查看是否尚未接通以及具体错误。响铃超时与已接通会话不是同一回事。
+
+模块温度只在变化 ≥3 °C 或每小时记录一次（≥60 °C 每次告警），不再每 30 秒刷屏，系统日志能保留更久的通话记录。
 
 procd 输出可能全标为 `daemon.err`，但应用字段 `level=INFO` 仍是信息日志；不要把标签当成故障。
 

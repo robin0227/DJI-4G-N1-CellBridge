@@ -267,6 +267,7 @@ func (c *Client) sendTextLocked(ctx context.Context, destination, body string) (
 // behind a command deadline).
 func (c *Client) Run(ctx context.Context) error {
 	buf := make([]byte, 256)
+	lostReads := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -274,8 +275,22 @@ func (c *Client) Run(ctx context.Context) error {
 		var n int
 		select {
 		case c.ioCh <- struct{}{}:
-			n, _ = readAvailable(c.port, buf)
+			var readErr error
+			n, readErr = readAvailable(c.port, buf)
 			<-c.ioCh
+			// A USB re-enumeration leaves this fd pointing at a removed
+			// device: every read then fails with EIO/ENODEV (or returns 0 =
+			// hangup) while /dev/ttyUSB2 reappears as a new node. Without
+			// this check the poll spun forever and health stayed "ok" with
+			// no working modem. Report it so the process can be restarted.
+			if portLost(c.port, n, readErr) {
+				lostReads++
+				if lostReads >= portLostReads {
+					return fmt.Errorf("%w: %v", ErrPortLost, readErr)
+				}
+			} else {
+				lostReads = 0
+			}
 		default:
 			// A command exchange owns the port; skip this poll.
 		}
@@ -303,6 +318,28 @@ func (c *Client) Run(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
+}
+
+// ErrPortLost reports that the serial device behind the client vanished.
+var ErrPortLost = errors.New("serial port lost")
+
+// portLostReads consecutive failed idle polls (~10 ms apart) are required
+// before the port is declared gone, so a single transient error is ignored.
+const portLostReads = 20
+
+// portLost classifies one idle read. Only real character devices qualify:
+// test fakes signal "no data" with io.EOF, which a TTY never does.
+func portLost(port io.ReadWriteCloser, n int, err error) bool {
+	if _, ok := port.(*os.File); !ok {
+		return false
+	}
+	if err == nil {
+		// O_NONBLOCK with VMIN=1 returns EAGAIN when idle; 0 bytes and no
+		// error is a hangup on a removed USB serial interface.
+		return n == 0
+	}
+	return errors.Is(err, syscall.EIO) || errors.Is(err, syscall.ENODEV) ||
+		errors.Is(err, syscall.ENXIO) || errors.Is(err, syscall.EBADF)
 }
 
 func readAvailable(port io.ReadWriteCloser, buffer []byte) (int, error) {

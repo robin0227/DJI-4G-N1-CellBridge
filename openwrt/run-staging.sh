@@ -65,12 +65,22 @@ wait_for_devices || {
 
 # JSON is valid YAML and safely represents arbitrary generated SIP passwords.
 SIP_USER="$SIP_USER" SIP_PASS="$SIP_PASS" SIP_USER2="$SIP_USER2" SIP_PASS2="$SIP_PASS2" \
-python3 - "$RUN/config.yaml" "$DATA" <<'PY'
+python3 - "$RUN/config.yaml" "$DATA" "$DIR/yak-push-token" <<'PY'
 import json
 import os
+from pathlib import Path
+import re
 import sys
 
-path, data_dir = sys.argv[1:]
+path, data_dir, token_file = sys.argv[1:]
+push_token = ""
+token_path = Path(token_file)
+if token_path.exists():
+    if token_path.is_symlink() or token_path.stat().st_mode & 0o077:
+        raise SystemExit("YakPhone token file must be private and not a symlink")
+    push_token = token_path.read_text(encoding="ascii").strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", push_token):
+        raise SystemExit("YakPhone token must be 64 hexadecimal characters")
 config = {
     "network": {"mode": "tailnet", "transport": "tailnet", "public_fallback": False},
     "server": {"listen": "127.0.0.1:8787"},
@@ -101,6 +111,8 @@ config = {
     },
     "security": {"pairing_local_only": True, "admin_local_only": True, "redact_logs": True},
 }
+if push_token:
+    config["sip"]["push_token"] = push_token
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(config, handle, ensure_ascii=False, indent=2)
     handle.write("\n")
@@ -108,4 +120,5 @@ PY
 chmod 600 "$RUN/config.yaml"
 
 echo "$$" > "$RUN/gateway.pid"
-exec "$DIR/cellbridge-gateway" -config "$RUN/config.yaml" -version n1-20260930 -log-level info
+VERSION=$(tr -dc 'A-Za-z0-9._-' < "$DIR/VERSION" 2>/dev/null || true)
+exec "$DIR/cellbridge-gateway" -config "$RUN/config.yaml" -version "${VERSION:-n1-20260930}" -log-level info

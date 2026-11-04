@@ -10,6 +10,7 @@
 *.pem
 *.key
 identity.secret
+yak-push-token
 authorized_keys
 **/voice-runtime/
 **/run/
