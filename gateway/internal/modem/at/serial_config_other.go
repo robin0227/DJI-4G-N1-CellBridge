@@ -2,10 +2,11 @@
 
 package at
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
-// configureSerialNative is only used by the Linux implementation. The
-// non-Linux build keeps the existing stty path in parser.go.
-func configureSerialNative(context.Context, string, int) error {
-	return nil
+func configureSerialNative(context.Context, int, string, int) error {
+	return fmt.Errorf("native termios configuration is only used on Linux")
 }

@@ -42,11 +42,62 @@ type Server struct {
 	// 一条"你好啊"被 Linphone 重传两次、对面收到两条；打字指示 XML 同样翻倍）。
 	seenMessages       sync.Map
 	inviteTransactions sync.Map // INVITE records survive session teardown briefly
+	reapCh             chan struct{}
 }
 
 func NewServer(listenAddr string, registrar *Registrar, auth *Auth, modemCtl *modem.ActiveCallAdapter, audio modem.VoiceAudio) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Server{listenAddr: listenAddr, registrar: registrar, auth: auth, modem: modemCtl, audio: audio, ctx: ctx, cancel: cancel}
+	return &Server{
+		listenAddr: listenAddr,
+		registrar:  registrar,
+		auth:       auth,
+		modem:      modemCtl,
+		audio:      audio,
+		ctx:        ctx,
+		cancel:     cancel,
+		reapCh:     make(chan struct{}, 4),
+	}
+}
+
+// RegisteredCount returns the number of active SIP handset registrations.
+func (s *Server) RegisteredCount() int {
+	if s.registrar == nil {
+		return 0
+	}
+	return len(s.registrar.All())
+}
+
+func (s *Server) scheduleGhostReap(delays ...time.Duration) {
+	if s.reapCh == nil {
+		return
+	}
+	for _, d := range delays {
+		delay := d
+		go func() {
+			if delay > 0 {
+				timer := time.NewTimer(delay)
+				defer timer.Stop()
+				select {
+				case <-s.ctx.Done():
+					return
+				case <-timer.C:
+				}
+			}
+			select {
+			case s.reapCh <- struct{}{}:
+			default:
+			}
+		}()
+	}
+}
+
+func audioSDP(localIP string, port int, direction string) string {
+	dirLine := ""
+	if direction != "" {
+		dirLine = "a=" + direction + "\r\n"
+	}
+	return fmt.Sprintf("v=0\r\no=cellbridge 0 1 IN IP4 %s\r\ns=CellBridge\r\nc=IN IP4 %s\r\nt=0 0\r\nm=audio %d RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-15\r\n%s",
+		localIP, localIP, port, dirLine)
 }
 
 // AttachEvents wires modem events (RING etc) and the YakPhone push token
@@ -133,10 +184,11 @@ func (s *Server) ForwardSMS(peer, body string) {
 			continue
 		}
 		local := s.localIPFor(remote)
+		reqURI := contactURI(reg.Contact, remote, reg.Username)
 		from := fmt.Sprintf("<sip:%s@%s>;tag=sms%d", caller, local, time.Now().UnixNano()%1000000)
 		callID := fmt.Sprintf("sms-%d-%s", time.Now().UnixNano(), reg.Username)
-		msg := fmt.Sprintf("MESSAGE sip:%s@%s SIP/2.0\r\nVia: SIP/2.0/UDP %s:5060;branch=z9hG4bKsms%d;rport\r\nMax-Forwards: 70\r\nFrom: %s\r\nTo: <sip:%s@%s>\r\nCall-ID: %s\r\nCSeq: 1 MESSAGE\r\nContact: <sip:cellbridge@%s:5060>\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\n\r\n%s",
-			reg.Username, local, local, time.Now().UnixNano()%100000, from, reg.Username, local, callID, local, len(body), body)
+		msg := fmt.Sprintf("MESSAGE %s SIP/2.0\r\nVia: SIP/2.0/UDP %s:5060;branch=z9hG4bKsms%d;rport\r\nMax-Forwards: 70\r\nFrom: %s\r\nTo: <sip:%s@%s>\r\nCall-ID: %s\r\nCSeq: 1 MESSAGE\r\nContact: <sip:cellbridge@%s:5060>\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\n\r\n%s",
+			reqURI, local, time.Now().UnixNano()%100000, from, reg.Username, local, callID, local, len(body), body)
 		if _, err := s.conn.WriteToUDP([]byte(msg), remote); err != nil {
 			slog.Warn("sms forward failed", "user", reg.Username, "peer", peer, "err", err)
 			continue
@@ -168,18 +220,25 @@ func (s *Server) Start(ctx context.Context) error {
 // ghostReaper clears cellular call contexts leaked by teardown races: a
 // CANCEL/BYE processed while ATD is still dialling can lose the race against
 // the module completing the call, leaving a connected call with no SIP
-// session owning it. Runs only when no session is live, so ATH can never
-// take down a call a client is actually on.
+// session owning it. Runs on startup, shortly after call teardowns, and on a
+// gentle 5-minute idle safety net (instead of polling AT+CLCC every 10s 24/7).
 func (s *Server) ghostReaper() {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
+	pruneTicker := time.NewTicker(time.Minute)
+	defer pruneTicker.Stop()
+	safetyTicker := time.NewTicker(5 * time.Minute)
+	defer safetyTicker.Stop()
+	s.scheduleGhostReap(5 * time.Second)
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
-		case <-ticker.C:
+		case <-pruneTicker.C:
+			s.pruneInviteTransactions()
+		case <-safetyTicker.C:
+			s.maybeReapGhosts()
+		case <-s.reapCh:
+			s.maybeReapGhosts()
 		}
-		s.maybeReapGhosts()
 	}
 }
 
@@ -399,7 +458,7 @@ func (s *Server) ringClients(event modem.ModemEvent) {
 			if reachable == "" {
 				reachable = local
 			}
-			inviteSDP := fmt.Sprintf("v=0\r\no=cellbridge 0 0 IN IP4 %s\r\ns=CellBridge\r\nc=IN IP4 %s\r\nt=0 0\r\nm=audio %d RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n", local, local, media.LocalAddr().Port)
+			inviteSDP := audioSDP(local, media.LocalAddr().Port, "")
 			callerHdrs, callerFrom := inboundCallerHeaders(peer, local)
 			// The Request-URI must be the Contact the client registered
 			// (RFC 3261 §10.3), not sip:<account>@<gateway>. YakPhone now
@@ -445,6 +504,19 @@ func (s *Server) ringClients(event modem.ModemEvent) {
 	sent := inviteRegistered()
 	if sent == 0 {
 		slog.Warn("sip inbound invite unsent", "call", callID, "peer", peer, "reason", "no registered client reachable yet; sweeping the registrar")
+	}
+	// Pre-warm the modem-side QDC507 voice route while the phone is ringing so
+	// pressing Accept can issue ATA immediately without waiting for route rotation.
+	if preparer, ok := s.audio.(interface {
+		PrepareRoute(context.Context) error
+	}); ok && preparer != nil {
+		go func() {
+			prepCtx, cancel := context.WithTimeout(sess.ctx, 15*time.Second)
+			defer cancel()
+			if err := preparer.PrepareRoute(prepCtx); err != nil && sess.ctx.Err() == nil {
+				slog.Warn("sip inbound route prewarm failed", "call", callID, "err", err)
+			}
+		}()
 	}
 	// Keep watching the registration table until the call is answered or gone.
 	// The VoIP push makes Linphone restart its SIP transport, and it comes back
@@ -600,9 +672,7 @@ func (s *Server) handleMessage(msg string, remote *net.UDPAddr) {
 		return
 	}
 	if strings.HasPrefix(first, "INFO") {
-		// SIP INFO DTMF / keepalive inside a call. The modem leg gets DTMF from
-		// RTP events; answering keeps the client from retransmitting for 32 s.
-		s.sendResponse(remote, msg, 200, "OK", "", "")
+		s.handleInfo(msg, remote)
 		return
 	}
 	if strings.HasPrefix(first, "ACK") {
@@ -627,6 +697,56 @@ func (s *Server) handleMessage(msg string, remote *net.UDPAddr) {
 }
 
 const sipAllow = "INVITE, ACK, BYE, CANCEL, OPTIONS, MESSAGE, INFO, UPDATE"
+
+// handleInfo answers SIP INFO requests inside a call and forwards any
+// application/dtmf-relay or application/dtmf digit to the cellular modem.
+func (s *Server) handleInfo(msg string, remote *net.UDPAddr) {
+	if digit, ok := parseInfoDTMF(msg); ok && s.modem != nil {
+		callID := parseHeader(msg, "Call-ID")
+		if v, loaded := s.sessions.Load(callID); loaded {
+			sess := v.(*SIPCallSession)
+			if sess.media != nil {
+				if current := sess.media.RemoteAddr(); current != nil && current.IP.Equal(remote.IP) {
+					go func() {
+						ctx, cancel := context.WithTimeout(sess.ctx, 5*time.Second)
+						defer cancel()
+						if err := s.modem.DTMF(ctx, digit); err != nil {
+							slog.Warn("sip info dtmf failed", "call", callID, "digit", string(digit), "err", err)
+							return
+						}
+						slog.Info("sip info dtmf sent", "call", callID, "digit", string(digit))
+					}()
+				}
+			}
+		}
+	}
+	s.sendResponse(remote, msg, 200, "OK", "", "")
+}
+
+func parseInfoDTMF(msg string) (rune, bool) {
+	ct := strings.ToLower(parseHeader(msg, "Content-Type"))
+	if !strings.Contains(ct, "dtmf") {
+		return 0, false
+	}
+	sections := strings.SplitN(msg, "\r\n\r\n", 2)
+	if len(sections) < 2 {
+		return 0, false
+	}
+	body := strings.TrimSpace(sections[1])
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if len(line) > 7 && strings.EqualFold(line[:7], "signal=") {
+			val := strings.TrimSpace(line[7:])
+			if len(val) >= 1 && strings.ContainsRune("0123456789*#ABCD", rune(val[0])) {
+				return rune(val[0]), true
+			}
+		}
+	}
+	if len(body) == 1 && strings.ContainsRune("0123456789*#ABCD", rune(body[0])) {
+		return rune(body[0]), true
+	}
+	return 0, false
+}
 
 // answerInDialogOffer answers a re-INVITE or UPDATE inside an existing call
 // and reports whether msg was one. An in-dialog request carries the To tag
@@ -663,7 +783,7 @@ func (s *Server) answerInDialogOffer(msg string, remote *net.UDPAddr) bool {
 	body := ""
 	if offer != "" {
 		hdrs += "Content-Type: application/sdp\r\n"
-		body = fmt.Sprintf("v=0\r\no=cellbridge 0 1 IN IP4 %s\r\ns=CellBridge\r\nc=IN IP4 %s\r\nt=0 0\r\nm=audio %d RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=%s\r\n", local, local, sess.media.LocalAddr().Port, sdpAnswerDirection(offer))
+		body = audioSDP(local, sess.media.LocalAddr().Port, sdpAnswerDirection(offer))
 	}
 	s.sendResponse(remote, msg, 200, "OK", hdrs, body)
 	method := strings.SplitN(msg, " ", 2)[0]
@@ -1032,8 +1152,27 @@ func (s *Server) handleInvite(msg string, remote *net.UDPAddr) {
 		slog.Info("sip invite offer", "peer", peer, "content_type", parseHeader(msg, "Content-Type"), "sdp", body)
 	}
 	if !s.authorizedRegisteredClient(msg, remote) {
-		s.sendResponse(remote, msg, 403, "Forbidden", "", "")
-		return
+		// If the gateway restarted and the handset hasn't refreshed REGISTER yet,
+		// challenge known users with Digest 401 instead of dead-end 403 so the
+		// phone transparently authenticates and completes the call.
+		if s.auth != nil && s.auth.HasUser(username) {
+			if s.auth.Verify(msg, username) {
+				if s.registrar != nil {
+					contact := parseHeader(msg, "Contact")
+					if contact == "" {
+						contact = fmt.Sprintf("<sip:%s@%s>", username, remote.String())
+					}
+					s.registrar.RegisterFrom(username, contact, "UDP", 300, remote)
+				}
+			} else {
+				hdrs := "WWW-Authenticate: " + WWWAuthHeader(s.auth.Realm(), s.auth.Nonce()) + "\r\n"
+				s.sendResponse(remote, msg, 401, "Unauthorized", hdrs, "")
+				return
+			}
+		} else {
+			s.sendResponse(remote, msg, 403, "Forbidden", "", "")
+			return
+		}
 	}
 	callID := parseHeader(msg, "Call-ID")
 	if callID == "" {
@@ -1041,9 +1180,9 @@ func (s *Server) handleInvite(msg string, remote *net.UDPAddr) {
 	}
 	if sess, ok := s.sessions.Load(callID); ok {
 		existing := sess.(*SIPCallSession)
-		hdrs := "Contact: <sip:cellbridge@" + s.localIPFor(remote) + ":5060>\r\nAllow: INVITE, ACK, BYE, CANCEL, OPTIONS\r\nContent-Type: application/sdp\r\n"
+		hdrs := "Contact: <sip:cellbridge@" + s.localIPFor(remote) + ":5060>\r\nAllow: " + sipAllow + "\r\nContent-Type: application/sdp\r\n"
 		if rx, tx := existing.media.Stats(); rx > 0 || tx > 0 || existing.State() == "active" {
-			sdp := fmt.Sprintf("v=0\r\no=cellbridge 0 0 IN IP4 %s\r\ns=CellBridge\r\nc=IN IP4 %s\r\nt=0 0\r\nm=audio %d RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n", s.localIPFor(remote), s.localIPFor(remote), existing.media.LocalAddr().Port)
+			sdp := audioSDP(s.localIPFor(remote), existing.media.LocalAddr().Port, "")
 			s.sendResponseWithTag(remote, msg, 200, "OK", hdrs, sdp, existing.ToTag())
 		} else {
 			s.sendResponseWithTag(remote, msg, 180, "Ringing", "Contact: <sip:cellbridge@"+s.localIPFor(remote)+":5060>\r\n", "", existing.ToTag())
@@ -1119,9 +1258,14 @@ func (s *Server) handleInvite(msg string, remote *net.UDPAddr) {
 	s.sendResponseWithTag(remote, msg, 180, "Ringing", "Contact: <sip:cellbridge@"+s.localIPFor(remote)+":5060>\r\n", "", sess.ToTag())
 	if err := sess.Dial(); err != nil {
 		slog.Warn("sip invite dial failed", "err", err)
-		s.sendResponseWithTag(remote, msg, 500, "Server Error", "", "", sess.ToTag())
+		if sess.ctx.Err() != nil {
+			s.sendResponseWithTag(remote, msg, 487, "Request Terminated", "", "", sess.ToTag())
+		} else {
+			s.sendResponseWithTag(remote, msg, 500, "Server Error", "", "", sess.ToTag())
+		}
 		s.sessions.Delete(callID)
 		_ = media.Close()
+		s.scheduleGhostReap(3*time.Second, 15*time.Second)
 		return
 	}
 	go func() {
@@ -1139,12 +1283,13 @@ func (s *Server) handleInvite(msg string, remote *net.UDPAddr) {
 			}
 			_ = sess.Hangup()
 			s.sessions.Delete(callID)
+			s.scheduleGhostReap(3*time.Second, 15*time.Second)
 			return
 		}
-		sdp := fmt.Sprintf("v=0\r\no=cellbridge 0 0 IN IP4 %s\r\ns=CellBridge\r\nc=IN IP4 %s\r\nt=0 0\r\nm=audio %d RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n", s.localIPFor(remote), s.localIPFor(remote), media.LocalAddr().Port)
-		hdrs := "Contact: <sip:cellbridge@" + s.localIPFor(remote) + ":5060>\r\nAllow: INVITE, ACK, BYE, CANCEL, OPTIONS\r\nContent-Type: application/sdp\r\n"
+		sdp := audioSDP(s.localIPFor(remote), media.LocalAddr().Port, "")
+		hdrs := "Contact: <sip:cellbridge@" + s.localIPFor(remote) + ":5060>\r\nAllow: " + sipAllow + "\r\nContent-Type: application/sdp\r\n"
 		s.sendResponseWithTag(remote, msg, 200, "OK", hdrs, sdp, sess.ToTag())
-		slog.Info("sip invite handled", "call", callID, "peer", peer, "rtp_remote", fmt.Sprintf("%s:%d", rtpIP, rtpPort))
+		slog.Info("sip invite handled", "call", callID, "peer", peer, "rtp_remote", media.RemoteAddr(), "sdp_ip", rtpIP, "sdp_port", rtpPort)
 	}()
 }
 
@@ -1174,17 +1319,9 @@ func (s *Server) handleAckBye(msg string, remote *net.UDPAddr, first string) {
 				"reason", parseHeader(msg, "Reason"))
 			_ = sess.Hangup()
 			s.sessions.Delete(callID)
-			// 快速一次性收割：CANCEL/BYE 与蜂窝拨号竞态时，模块可能随后
-			// 才完成应答，留下一具没人认领的"活尸"。3 秒后清一次，不等
-			// 10 秒周期。
-			go func() {
-				select {
-				case <-s.ctx.Done():
-					return
-				case <-time.After(3 * time.Second):
-				}
-				s.maybeReapGhosts()
-			}()
+			// 快速收割：CANCEL/BYE 与蜂窝拨号竞态时，模块可能随后才完成应答，
+			// 在 +3s 与 +15s 触发清理（平时空闲不再每 10s 轮询 AT+CLCC）。
+			s.scheduleGhostReap(3*time.Second, 15*time.Second)
 		}
 	}
 	s.sendResponse(remote, msg, 200, "OK", "", "")
@@ -1625,17 +1762,51 @@ func parseSDPRTP(sdp string) (string, int) {
 // answered before giving up on the SIP call.
 const answerTimeout = 90 * time.Second
 
-// localTailnetIP returns the NAS tailnet IPv4 address by walking its
-// interfaces, preferring tailscale0.
+// localTailnetIP returns the Tailscale IPv4 address (100.64.0.0/10) by walking
+// interfaces, explicitly preferring tailscale* (Linux/OpenWrt) and falling back
+// to tunnel interfaces (utun*/wg*/ts* on macOS) so an ISP CGNAT WAN address on
+// pppoe-wan/eth0 is never mistaken for the tailnet IP.
 func localTailnetIP() string {
-	if addrs, err := net.InterfaceAddrs(); err == nil {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	return selectTailnetIP(interfaces)
+}
+
+func isTailnetCGNAT(ip net.IP) bool {
+	ip4 := ip.To4()
+	return ip4 != nil && ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127
+}
+
+func selectTailnetIP(interfaces []net.Interface) string {
+	fallback := ""
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		name := strings.ToLower(iface.Name)
+		isTailscaleName := strings.HasPrefix(name, "tailscale")
+		isTunnelName := strings.HasPrefix(name, "utun") || strings.HasPrefix(name, "wg") || strings.HasPrefix(name, "ts")
+		if !isTailscaleName && !isTunnelName {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
 		for _, a := range addrs {
-			if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
-				if strings.HasPrefix(ipnet.IP.String(), "100.") {
-					return ipnet.IP.String()
-				}
+			ipnet, ok := a.(*net.IPNet)
+			if !ok || !isTailnetCGNAT(ipnet.IP) {
+				continue
+			}
+			if isTailscaleName {
+				return ipnet.IP.To4().String()
+			}
+			if fallback == "" {
+				fallback = ipnet.IP.To4().String()
 			}
 		}
 	}
-	return ""
+	return fallback
 }

@@ -89,6 +89,19 @@ type byePlan struct {
 func NewSIPCallSession(id, peer, dir string, modemCtl *modem.ActiveCallAdapter, audio modem.VoiceAudio, media *MediaSession) *SIPCallSession {
 	ctx, cancel := context.WithCancel(context.Background())
 	br := voice.NewBridge(audio, media)
+	if media != nil && modemCtl != nil {
+		media.OnDTMF(func(digit rune) {
+			go func() {
+				dtmfCtx, dtmfCancel := context.WithTimeout(ctx, 5*time.Second)
+				defer dtmfCancel()
+				if err := modemCtl.DTMF(dtmfCtx, digit); err != nil {
+					slog.Warn("sip rtp dtmf failed", "call", id, "digit", string(digit), "err", err)
+					return
+				}
+				slog.Info("sip rtp dtmf sent", "call", id, "digit", string(digit))
+			}()
+		})
+	}
 	return &SIPCallSession{ID: id, Peer: peer, Direction: dir, modem: modemCtl, audio: audio, media: media, bridge: br, ctx: ctx, cancel: cancel, state: "init"}
 }
 

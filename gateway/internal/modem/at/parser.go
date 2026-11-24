@@ -272,6 +272,10 @@ func (c *Client) Run(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		ready, usedPoll := waitPortReadable(c.port, 200)
+		if !ready {
+			continue
+		}
 		var n int
 		select {
 		case c.ioCh <- struct{}{}:
@@ -292,7 +296,9 @@ func (c *Client) Run(ctx context.Context) error {
 				lostReads = 0
 			}
 		default:
-			// A command exchange owns the port; skip this poll.
+			// A command exchange owns the port; brief yield to avoid spin while
+			// the fd still has unread bytes belonging to that command.
+			usedPoll = false
 		}
 		var lines []string
 		if n > 0 {
@@ -307,6 +313,9 @@ func (c *Client) Run(ctx context.Context) error {
 			if handler != nil {
 				handler(line)
 			}
+		}
+		if usedPoll && lostReads == 0 {
+			continue
 		}
 		timer := time.NewTimer(10 * time.Millisecond)
 		select {
@@ -428,6 +437,35 @@ type readResult struct {
 // is the portable way to wake the blocked kernel read. The caller is already
 // abandoning that serial client, so the close is intentional.
 func readWithContext(ctx context.Context, port io.ReadWriteCloser, buffer []byte) (int, error) {
+	// Non-blocking *os.File reads return immediately without spawning a
+	// goroutine per attempt; poll briefly in the kernel when idle.
+	if _, ok := port.(*os.File); ok {
+		for {
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
+			n, err := readOnce(port, buffer)
+			if !isRetryableReadError(err) {
+				return n, err
+			}
+			ready, usedPoll := waitPortReadable(port, 25)
+			if usedPoll {
+				if !ready {
+					continue
+				}
+				continue
+			}
+			timer := time.NewTimer(10 * time.Millisecond)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return 0, ctx.Err()
+			}
+		}
+	}
 	for {
 		result := make(chan readResult, 1)
 		go func() {
@@ -498,16 +536,16 @@ func OpenSerial(ctx context.Context, path string, baud int) (*Client, error) {
 		_ = file.Close()
 		return nil, fmt.Errorf("configure nonblocking mode for serial port %s: %w", path, err)
 	}
-	if err := configureSerial(ctx, path, baud); err != nil {
+	if err := configureSerial(ctx, int(file.Fd()), path, baud); err != nil {
 		_ = file.Close()
 		return nil, err
 	}
 	return NewClient(file), nil
 }
 
-func configureSerial(ctx context.Context, path string, baud int) error {
+func configureSerial(ctx context.Context, fd int, path string, baud int) error {
 	if runtime.GOOS == "linux" {
-		return configureSerialNative(ctx, path, baud)
+		return configureSerialNative(ctx, fd, path, baud)
 	}
 	args := []string{"raw", "-echo", fmt.Sprint(baud)}
 	if runtime.GOOS == "darwin" {

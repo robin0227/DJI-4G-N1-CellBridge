@@ -181,9 +181,15 @@ func (e *Engine) Send(ctx context.Context, to, body string) (*db.Message, error)
 	return &message, nil
 }
 
+type smsNotifier interface {
+	SMSNotify() <-chan struct{}
+}
+
 // Run polls the modem inbox, consumes complete messages, and deletes only
 // successfully decoded/inserted storage entries. A crash before deletion is
-// safe because PDU hashes make the next poll idempotent.
+// safe because PDU hashes make the next poll idempotent. If the modem also
+// emits +CMTI/+CMT URCs via SMSNotify(), inbound SMS is ingested immediately
+// without waiting for the fallback poll interval.
 func (e *Engine) Run(ctx context.Context, interval time.Duration, onMessage func(*db.Message)) error {
 	inbox, ok := e.Modem.(InboxModem)
 	if !ok {
@@ -192,10 +198,19 @@ func (e *Engine) Run(ctx context.Context, interval time.Duration, onMessage func
 	if interval <= 0 {
 		interval = 5 * time.Second
 	}
+	var notifyCh <-chan struct{}
+	if notifier, ok := e.Modem.(smsNotifier); ok {
+		notifyCh = notifier.SMSNotify()
+	}
 	var cursor modem.SMSCursor
+	var lastPrune time.Time
 	poll := func() error {
-		e.Assembler.Prune(e.Now())
-		_ = e.Database.PrunePendingSMSSegments(ctx, e.Now().Add(-MultipartRetention))
+		now := e.Now()
+		e.Assembler.Prune(now)
+		if lastPrune.IsZero() || now.Sub(lastPrune) >= 10*time.Minute {
+			_ = e.Database.PrunePendingSMSSegments(ctx, now.Add(-MultipartRetention))
+			lastPrune = now
+		}
 		// Bound every modem exchange so an unresponsive AT response can
 		// never wedge the shared serial port (and with it call setup).
 		// Observed 2026-09-06: ListSMS's AT+CPMS="MT" read blocked
@@ -239,6 +254,17 @@ func (e *Engine) Run(ctx context.Context, interval time.Duration, onMessage func
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
+			_ = poll()
+		case <-notifyCh:
+			// Brief coalesce window so concatenated multipart SMS parts
+			// arriving back-to-back are fetched together in one ListSMS.
+			coalesce := time.NewTimer(250 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				coalesce.Stop()
+				return ctx.Err()
+			case <-coalesce.C:
+			}
 			_ = poll()
 		}
 	}

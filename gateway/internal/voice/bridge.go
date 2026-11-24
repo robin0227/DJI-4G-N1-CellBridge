@@ -4,6 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,6 +50,7 @@ type Bridge struct {
 	clientSum         uint64
 	cellularWindowAt  time.Time
 	clientWindowAt    time.Time
+	downlinkScale     float64
 	mu                sync.Mutex
 	// writeMu serialises modem playback writes with Stop. It is separate from
 	// mu so a write blocked on aplay never stalls the RTP receive callback,
@@ -81,6 +86,7 @@ func (b *Bridge) Start(ctx context.Context, callID modem.CallID) error {
 	b.clientNonZero, b.cellularNonZero = 0, 0
 	b.clientSum, b.cellularSum = 0, 0
 	b.clientWindowAt, b.cellularWindowAt = time.Now(), time.Now()
+	b.downlinkScale = parseDownlinkGainScale()
 	b.mu.Unlock()
 	onFrame := func(seq uint16, frame []byte) {
 		if len(frame) != FrameSamples {
@@ -258,7 +264,11 @@ func (b *Bridge) readLoop(ctx context.Context, callID modem.CallID) {
 			b.cellularPeakMax = 0
 			b.cellularNonZero, b.cellularSum = 0, 0
 		}
+		scale := b.downlinkScale
 		b.mu.Unlock()
+		if scale != 1.0 && scale > 0 {
+			applyGain(pcm, scale)
+		}
 		frame, err := EncodePCMU(pcm)
 		if err != nil {
 			slog.Warn("voice cellular frame encode failed", "call_id", callID, "error", err)
@@ -314,6 +324,30 @@ func pcmPeak(samples []int16) int {
 		}
 	}
 	return peak
+}
+
+func parseDownlinkGainScale() float64 {
+	raw := strings.TrimSpace(os.Getenv("CELLBRIDGE_DOWNLINK_GAIN_DB"))
+	if raw == "" {
+		return 1.0
+	}
+	db, err := strconv.ParseFloat(raw, 64)
+	if err != nil || db < -24 || db > 6 || db == 0 {
+		return 1.0
+	}
+	return math.Pow(10, db/20.0)
+}
+
+func applyGain(samples []int16, scale float64) {
+	for i, s := range samples {
+		v := int(math.Round(float64(s) * scale))
+		if v > 32767 {
+			v = 32767
+		} else if v < -32768 {
+			v = -32768
+		}
+		samples[i] = int16(v)
+	}
 }
 
 func (b *Bridge) Stop(ctx context.Context) error {

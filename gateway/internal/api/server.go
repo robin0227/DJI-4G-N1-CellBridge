@@ -62,9 +62,11 @@ type Server struct {
 	PushSender        push.Sender
 	YakPushToken      string // official YakPhone push token (push.yakteam.com)
 	// InboundSMSNotifier 把入站短信交给 SIP 服务转发给客户端（Linphone 聊天页）。
-	InboundSMSNotifier func(peer, body string)
-	lineMu            sync.RWMutex
-	webrtcMu          sync.Mutex
+	InboundSMSNotifier   func(peer, body string)
+	SIPRegistrationCount func() int
+	lineMu               sync.RWMutex
+	modemTempC           *float64
+	webrtcMu             sync.Mutex
 	webrtcCalls       map[string]*webrtc.Session
 	voiceBridges      map[string]*voice.Bridge
 	rateMu            sync.Mutex
@@ -142,15 +144,44 @@ func method(expected string, handler endpoint) http.HandlerFunc {
 	}
 }
 
+func (s *Server) SetModemTemp(tempC float64) {
+	s.lineMu.Lock()
+	v := tempC
+	s.modemTempC = &v
+	s.lineMu.Unlock()
+}
+
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	s.lineMu.RLock()
 	line := s.Line
+	var temp *float64
+	if s.modemTempC != nil {
+		v := *s.modemTempC
+		temp = &v
+	}
 	s.lineMu.RUnlock()
 	status := "ok"
 	if line.SMS == "unavailable" && line.Voice == "unavailable" {
 		status = "degraded"
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": status, "version": s.Version})
+	payload := map[string]any{
+		"status":  status,
+		"version": s.Version,
+	}
+	if line.Registration != "" && line.Registration != "unknown" {
+		payload["registration"] = line.Registration
+	}
+	if line.Signal.RSSI != 0 {
+		payload["signal_bars"] = line.Signal.Bars
+		payload["rssi_dbm"] = line.Signal.RSSI
+	}
+	if temp != nil {
+		payload["modem_temp_c"] = *temp
+	}
+	if s.SIPRegistrationCount != nil {
+		payload["sip_registrations"] = s.SIPRegistrationCount()
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 // identity is intentionally unauthenticated: it is the discovery handshake
@@ -1754,7 +1785,10 @@ func (s *Server) sendMessagePush(message db.Message) {
 	// notifications (type=message). The legacy APNs Broker is kept as a
 	// fallback for non-YakPhone targets.
 	if s.YakPushToken != "" {
-		s.sendYakPhonePush("message", "sip:"+message.Peer, message.Body)
+		// Dispatch asynchronously so a slow/flaky push.yakteam.com HTTP call
+		// (up to 10s timeout) never starves sms.Engine's post-ingest DeleteSMS
+		// deadline and never allows the modem's 23-slot MT inbox to fill up.
+		go s.sendYakPhonePush("message", "sip:"+message.Peer, message.Body)
 	}
 	if s.Database == nil {
 		slog.Warn("push skipped", "kind", "message", "reason", "database unavailable", "error_code", "BLOCKED_EXTERNAL_APNS", "message_id", message.ID)

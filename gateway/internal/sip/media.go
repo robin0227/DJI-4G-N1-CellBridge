@@ -1,6 +1,8 @@
 package sip
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"log/slog"
 	"net"
 	"sync"
@@ -10,10 +12,11 @@ import (
 	"github.com/pion/rtp"
 )
 
-// MediaSession carries one call's RTP (PCMU/8000). Sequence numbers and
-// timestamps must advance per packet or strict RTP stacks (baresip /
-// YakPhone) discard every packet as a duplicate — the earlier constant-0
-// bug produced silent calls.
+const dtmfPayloadType uint8 = 101
+
+// MediaSession carries one call's RTP (PCMU/8000 + RFC 4733 DTMF). Sequence
+// numbers and timestamps must advance per packet or strict RTP stacks
+// (baresip / YakPhone) discard every packet as a duplicate.
 type MediaSession struct {
 	conn        *net.UDPConn
 	remoteAddr  *net.UDPAddr
@@ -26,6 +29,17 @@ type MediaSession struct {
 	ts          uint32
 	rx          int64
 	tx          int64
+	onDTMF      func(rune)
+	lastDTMFTS  uint32
+	hasDTMFTS   bool
+}
+
+func randomUint32() uint32 {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return uint32(time.Now().UnixNano())
+	}
+	return binary.BigEndian.Uint32(b[:])
 }
 
 func NewMediaSession(localAddr string) (*MediaSession, error) {
@@ -41,7 +55,17 @@ func NewMediaSession(localAddr string) (*MediaSession, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &MediaSession{conn: conn, ssrc: 0x12345678, payloadType: 0}, nil
+	ssrc := randomUint32()
+	if ssrc == 0 {
+		ssrc = 0x12345678
+	}
+	return &MediaSession{
+		conn:        conn,
+		ssrc:        ssrc,
+		seq:         uint16(randomUint32()),
+		ts:          randomUint32(),
+		payloadType: 0,
+	}, nil
 }
 
 func (m *MediaSession) LocalAddr() *net.UDPAddr { return m.conn.LocalAddr().(*net.UDPAddr) }
@@ -61,6 +85,13 @@ func (m *MediaSession) SetRemote(addr string) error {
 	m.remoteAddr = ra
 	m.mu.Unlock()
 	return nil
+}
+
+// OnDTMF registers a callback for RFC 4733 telephone-event digits (PT=101).
+func (m *MediaSession) OnDTMF(fn func(rune)) {
+	m.mu.Lock()
+	m.onDTMF = fn
+	m.mu.Unlock()
 }
 
 func (m *MediaSession) WritePCMU(frame []byte) error {
@@ -99,9 +130,8 @@ func (m *MediaSession) OnPCMUFrame(fn func([]byte)) {
 //
 // RTP that queued in the socket before the reader started is discarded
 // first. The phone starts sending the moment it answers, but the bridge only
-// starts after the modem has picked up the cellular leg (~2.3 s later); those
-// ~115 stale frames then hit the jitter buffer in one burst, ~100 overflowed
-// and the rest added 300 ms of delay at the start of every call (2026-11-04).
+// starts after the modem has picked up the cellular leg; stale frames would
+// otherwise hit the jitter buffer in one burst and add delay at call start.
 func (m *MediaSession) OnSequencedPCMUFrame(fn func(seq uint16, frame []byte)) {
 	if stale := m.discardQueued(); stale > 0 {
 		slog.Info("rtp stale packets discarded", "local", m.LocalAddr().String(), "packets", stale)
@@ -123,6 +153,24 @@ func (m *MediaSession) OnSequencedPCMUFrame(fn func(seq uint16, frame []byte)) {
 			if err := pkt.Unmarshal(buf[:n]); err != nil {
 				continue
 			}
+			// RFC 4733 DTMF event: 4-byte payload on PT=101. Never forwarded as PCMU audio.
+			if pkt.PayloadType == dtmfPayloadType && len(pkt.Payload) == 4 {
+				if digit, ok := decodeRFC4733Digit(pkt.Payload[0]); ok {
+					m.mu.Lock()
+					allowed := !m.closed && (m.remoteAddr == nil || remote.IP.Equal(m.remoteAddr.IP))
+					var cb func(rune)
+					if allowed && (!m.hasDTMFTS || pkt.Timestamp != m.lastDTMFTS) {
+						m.hasDTMFTS = true
+						m.lastDTMFTS = pkt.Timestamp
+						cb = m.onDTMF
+					}
+					m.mu.Unlock()
+					if cb != nil {
+						cb(digit)
+					}
+				}
+				continue
+			}
 			if pkt.PayloadType != 0 || len(pkt.Payload) != 160 {
 				continue
 			}
@@ -131,11 +179,26 @@ func (m *MediaSession) OnSequencedPCMUFrame(fn func(seq uint16, frame []byte)) {
 				m.mu.Unlock()
 				continue
 			}
+			// Symmetric RTP (RFC 4961): if the authenticated peer sends media
+			// from a NAT-mapped port different from its SDP port, latch onto it.
+			if m.remoteAddr != nil && remote.Port != 0 && m.remoteAddr.Port != remote.Port {
+				m.remoteAddr = &net.UDPAddr{IP: append(net.IP(nil), remote.IP...), Port: remote.Port, Zone: remote.Zone}
+				slog.Info("rtp symmetric port latched", "remote", m.remoteAddr.String())
+			}
 			m.rx++
 			m.mu.Unlock()
 			fn(pkt.SequenceNumber, pkt.Payload)
 		}
 	}()
+}
+
+var rfc4733Digits = [...]rune{'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '#', 'A', 'B', 'C', 'D'}
+
+func decodeRFC4733Digit(code byte) (rune, bool) {
+	if int(code) >= len(rfc4733Digits) {
+		return 0, false
+	}
+	return rfc4733Digits[code], true
 }
 
 // discardQueued drops every datagram already waiting on the socket.

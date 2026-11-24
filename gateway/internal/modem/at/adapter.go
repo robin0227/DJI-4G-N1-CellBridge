@@ -33,21 +33,32 @@ type Adapter struct {
 	pendingPeer  string
 	incomingSent bool
 	clipOnce     sync.Once
+	tempCmd      string
 	// lastResistLog 给"幽灵上下文清不掉"的告警限频（一分钟一次）。
 	lastResistLog time.Time
 	capMu         sync.RWMutex
 	caps          modem.Capabilities
 	events        chan modem.ModemEvent
+	smsNotify     chan struct{}
 	close         sync.Once
 }
 
 func NewAdapter(client *Client) *Adapter {
-	adapter := &Adapter{client: client, events: make(chan modem.ModemEvent, 32)}
+	adapter := &Adapter{
+		client:    client,
+		events:    make(chan modem.ModemEvent, 32),
+		smsNotify: make(chan struct{}, 1),
+	}
 	if client != nil {
 		client.SetLineHandler(adapter.HandleURC)
 	}
 	return adapter
 }
+
+// SMSNotify signals when the modem emits an unsolicited +CMTI/+CMT line so
+// the SMS inbox reader can ingest verification codes immediately instead of
+// waiting for the next polling interval.
+func (a *Adapter) SMSNotify() <-chan struct{} { return a.smsNotify }
 
 func (a *Adapter) Probe(ctx context.Context) (modem.Capabilities, error) {
 	if a.client == nil {
@@ -57,11 +68,12 @@ func (a *Adapter) Probe(ctx context.Context) (modem.Capabilities, error) {
 	if err != nil {
 		return modem.Capabilities{}, err
 	}
-	// Enable caller-id presentation so inbound calls carry a number
-	// instead of surfacing as "unknown". Idempotent, and harmless on
-	// modems where it is already on.
+	// Enable caller-id presentation (+CLIP) and new-SMS URC indication (+CNMI)
+	// so inbound calls carry a number and inbound SMS wakes the inbox reader
+	// immediately instead of waiting for the next poll interval.
 	a.clipOnce.Do(func() {
 		_, _ = a.client.Exchange(ctx, "AT+CLIP=1")
+		_, _ = a.client.Exchange(ctx, "AT+CNMI=2,1,0,0,0")
 	})
 	model, _ := firstPayload(a.client.Exchange(ctx, "AT+CGMM"))
 	revision, _ := firstPayload(a.client.Exchange(ctx, "AT+CGMR"))
@@ -139,7 +151,19 @@ func (a *Adapter) Temperature(ctx context.Context) (tempC float64, source string
 	if a.client == nil {
 		return 0, "", fmt.Errorf("AT client is unavailable")
 	}
-	for _, cmd := range []string{"AT+QTEMP", "AT+CPUTEMP?"} {
+	a.mu.Lock()
+	preferred := a.tempCmd
+	a.mu.Unlock()
+	cmds := []string{"AT+QTEMP", "AT+CPUTEMP?"}
+	if preferred != "" {
+		cmds = []string{preferred}
+		if preferred == "AT+QTEMP" {
+			cmds = append(cmds, "AT+CPUTEMP?")
+		} else {
+			cmds = append(cmds, "AT+QTEMP")
+		}
+	}
+	for _, cmd := range cmds {
 		lines, exErr := a.client.Exchange(ctx, cmd)
 		if exErr != nil {
 			continue
@@ -150,6 +174,11 @@ func (a *Adapter) Temperature(ctx context.Context) (tempC float64, source string
 				continue
 			}
 			if t, ok := firstTempNumber(line); ok {
+				if preferred != cmd {
+					a.mu.Lock()
+					a.tempCmd = cmd
+					a.mu.Unlock()
+				}
 				return t, cmd, nil
 			}
 		}
@@ -254,9 +283,15 @@ func (a *Adapter) Hangup(ctx context.Context, callID modem.CallID) error {
 		return err
 	}
 	_, err := a.client.Exchange(ctx, "ATH")
-	if err == nil {
-		a.finishActive(callID, "local_hangup")
+	if err != nil {
+		// Quectel/QDC507 builds sometimes reject ATH during teardown races;
+		// try AT+CHUP as fallback and always clear local active/ring state
+		// so a failed hangup cannot permanently wedge all subsequent calls.
+		if _, chupErr := a.client.Exchange(ctx, "AT+CHUP"); chupErr == nil {
+			err = nil
+		}
 	}
+	a.finishActive(callID, "local_hangup")
 	return err
 }
 
@@ -545,6 +580,12 @@ func (a *Adapter) HandleURC(line string) {
 	a.mu.Unlock()
 	var event modem.ModemEvent
 	switch {
+	case strings.HasPrefix(line, "+CMTI:"), strings.HasPrefix(line, "+CMT:"):
+		select {
+		case a.smsNotify <- struct{}{}:
+		default:
+		}
+		return
 	case strings.HasPrefix(line, "+CLIP:"):
 		// +CLIP: "13800138000",129,,,,0 — caller id, normally the line
 		// immediately after the first RING. Stash it for
@@ -712,10 +753,15 @@ func normalizeSIM(value string) string {
 
 func normalizeRegistration(value string) string {
 	value = strings.TrimSpace(value)
-	if index := strings.LastIndex(value, ","); index >= 0 {
+	if index := strings.IndexByte(value, ':'); index >= 0 {
 		value = strings.TrimSpace(value[index+1:])
 	}
-	switch value {
+	fields := strings.Split(value, ",")
+	stat := strings.TrimSpace(fields[0])
+	if len(fields) >= 2 {
+		stat = strings.TrimSpace(fields[1])
+	}
+	switch stat {
 	case "1", "5":
 		return "registered"
 	case "2":

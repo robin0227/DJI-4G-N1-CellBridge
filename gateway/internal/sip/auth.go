@@ -31,6 +31,16 @@ func (a *Auth) AddUser(username, password string) {
 	a.users[username] = password
 }
 
+func (a *Auth) HasUser(username string) bool {
+	if username == "" {
+		return false
+	}
+	a.mu.RLock()
+	_, ok := a.users[username]
+	a.mu.RUnlock()
+	return ok
+}
+
 func (a *Auth) Check(username, password string) bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -48,7 +58,11 @@ func (a *Auth) NeedsAuth(msg string) bool {
 // Verify checks the actual Digest response, not just the presence of a header.
 // MD5 is retained for existing SIP handset compatibility; this is not TLS.
 func (a *Auth) Verify(msg, username string) bool {
-	d, ok := digestFields(parseHeader(msg, "Authorization"))
+	authHeader := parseHeader(msg, "Authorization")
+	if authHeader == "" {
+		authHeader = parseHeader(msg, "Proxy-Authorization")
+	}
+	d, ok := digestFields(authHeader)
 	if !ok || username == "" || d["username"] != username || d["realm"] != a.realm || d["nonce"] != a.nonce {
 		return false
 	}

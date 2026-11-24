@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +36,7 @@ type ALSAAudio struct {
 	rx       io.ReadCloser
 	tx       io.WriteCloser
 	txMu     sync.Mutex
+	route    externalRouteCache
 	once     sync.Once
 }
 
@@ -63,7 +66,30 @@ func (a *ALSAAudio) Probe(ctx context.Context) (modem.AudioCapabilities, error) 
 // call. This is optional for ordinary ALSA devices and enabled only when the
 // deployment supplies CELLBRIDGE_ROUTE_HELPER.
 func (a *ALSAAudio) PrepareRoute(ctx context.Context) error {
-	return prepareExternalRoute(ctx)
+	return a.route.Prepare(ctx)
+}
+
+const (
+	defaultCapturePeriod = 320  // 40 ms @ 8 kHz (down from 128 ms burst period)
+	defaultCaptureBuffer = 2560 // 320 ms ring for UAC ASYNC XRUN headroom
+)
+
+func alsaCaptureSizing() (period, buffer int) {
+	period, buffer = defaultCapturePeriod, defaultCaptureBuffer
+	if raw := strings.TrimSpace(os.Getenv("CELLBRIDGE_ALSA_CAPTURE_PERIOD")); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v >= 80 && v <= 4096 {
+			period = v
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("CELLBRIDGE_ALSA_CAPTURE_BUFFER")); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v >= period*2 && v <= 32768 {
+			buffer = v
+		}
+	}
+	if buffer < period*2 {
+		buffer = period * 4
+	}
+	return period, buffer
 }
 
 // snapshot returns the current pair for IO.
@@ -124,7 +150,8 @@ func (a *ALSAAudio) Start(ctx context.Context, callID modem.CallID) error {
 		_ = tx.Close()
 	}
 
-	newCapture := exec.Command("arecord", "-q", "-D", a.captureDevice, "-t", "raw", "-f", "S16_LE", "-r", fmt.Sprint(SampleRate), "-c", fmt.Sprint(Channels), "--buffer-size=8192", "--period-size=1024")
+	capturePeriod, captureBuffer := alsaCaptureSizing()
+	newCapture := exec.Command("arecord", "-q", "-D", a.captureDevice, "-t", "raw", "-f", "S16_LE", "-r", fmt.Sprint(SampleRate), "-c", fmt.Sprint(Channels), fmt.Sprintf("--buffer-size=%d", captureBuffer), fmt.Sprintf("--period-size=%d", capturePeriod))
 	newPlayback := exec.Command("aplay", "-q", "-D", a.playbackDevice, "-t", "raw", "-f", "S16_LE", "-r", fmt.Sprint(SampleRate), "-c", fmt.Sprint(Channels), "--buffer-size=640", "--period-size=160")
 	newCapture.Stderr = io.Discard
 	newPlayback.Stderr = io.Discard
@@ -161,10 +188,12 @@ func (a *ALSAAudio) Start(ctx context.Context, callID modem.CallID) error {
 	a.mu.Lock()
 	a.capture, a.playback, a.rx, a.tx = newCapture, newPlayback, newRx, newTx
 	a.mu.Unlock()
+	// Mark the route consumed so the next call gets a fresh rotation.
+	a.route.MarkConsumed()
 	// Bridge.clientPlaybackLoop is the single 20ms playback clock. It writes
 	// silence whenever RTP is absent, keeping UAC full-duplex RUNNING without
 	// a second writer that can overfill aplay's pipe and add seconds of delay.
-	slog.Info("alsa pair started", "call_id", callID, "capture", a.captureDevice, "playback", a.playbackDevice)
+	slog.Info("alsa pair started", "call_id", callID, "capture", a.captureDevice, "playback", a.playbackDevice, "capture_period", capturePeriod, "capture_buffer", captureBuffer)
 	return nil
 }
 

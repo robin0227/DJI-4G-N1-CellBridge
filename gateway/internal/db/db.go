@@ -32,7 +32,7 @@ func Open(path string) (*DB, error) {
 }
 
 func (database *DB) Migrate(ctx context.Context) error {
-	if _, err := database.ExecContext(ctx, `PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;`); err != nil {
+	if _, err := database.ExecContext(ctx, `PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000; PRAGMA temp_store = MEMORY; PRAGMA foreign_keys = ON;`); err != nil {
 		return fmt.Errorf("enable sqlite pragmas: %w", err)
 	}
 	schema, err := schemaFS.ReadFile("schema.sql")

@@ -328,9 +328,10 @@ func run() int {
 				slog.Warn("modem URC reader stopped", "error", runErr)
 			}
 		}()
-		// 模块温度遥测：每 30s 读一次 AT+QTEMP/AT+CPUTEMP，过热告警（仅观察，
-		// 不擅自降频——降频请用 CELLBRIDGE_SMS_POLL_INTERVAL）。
-		go thermalMonitor(shutdownContext, serialAdapter)
+		// 模块温度遥测：常温 60s / 高温 30s 读一次 AT+QTEMP/AT+CPUTEMP，过热告警并更新健康接口。
+		go thermalMonitor(shutdownContext, serialAdapter, application.SetModemTemp)
+		// 低频刷新蜂窝状态（每 2 分钟且无通话时），避免 /api/v1/line 和 /api/v1/health 永远停在开机快照。
+		go statusMonitor(shutdownContext, serialAdapter, capabilities, application)
 		if settings.SIP.Enabled {
 			registrar := sip.NewRegistrar()
 			sipAuth := sip.NewAuth(settings.SIP.Realm)
@@ -339,6 +340,7 @@ func run() int {
 			}
 			sipServer := sip.NewServer(settings.SIP.Listen, registrar, sipAuth, callModem, application.VoiceAudio)
 			application.YakPushToken = settings.SIP.PushToken
+			application.SIPRegistrationCount = sipServer.RegisteredCount
 			sipServer.AttachEvents(sipEvents, settings.SIP.PushToken)
 			// Linphone 锁屏来电推送：Key 走环境变量（不经上游 config 结构），
 			// 由 start_cellbridge.sh 从 ~/.cellbridge/linphone_push_key 注入。
@@ -411,42 +413,80 @@ func recordingEventPayload(item db.Recording) map[string]any {
 	return value
 }
 
-// thermalMonitor reads the cellular module's internal temperature every 30s
-// and warns when it runs hot. A 24/7 gateway in a closed enclosure cooks the
-// module; catching it early avoids RF throttling and dropped calls. It only
-// reads AT (no throttling of its own) so it never adds to the heat it watches.
-//
-// Normal readings are logged at INFO only when they move by
-// thermalLogDelta or once per thermalLogEvery. Logging all 2880 samples a day
-// filled OpenWrt's small logread ring within hours and pushed the SIP/call
-// lines needed for troubleshooting out of the buffer.
-func thermalMonitor(ctx context.Context, m *at.Adapter) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+// thermalMonitor reads the cellular module's internal temperature periodically
+// (60s when cool, 30s when >= 55°C) and warns when it runs hot. Normal readings
+// are logged at INFO only when they move by thermalLogDelta or once per hour.
+func thermalMonitor(ctx context.Context, m *at.Adapter, onTemp func(float64)) {
 	var throttle thermalLogThrottle
-	read := func() {
-		c, src, err := m.Temperature(ctx)
+	read := func() time.Duration {
+		readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		c, src, err := m.Temperature(readCtx)
+		cancel()
 		if err != nil {
 			slog.Debug("modem temperature unavailable", "err", err)
-			return
+			return 60 * time.Second
+		}
+		if onTemp != nil {
+			onTemp(c)
 		}
 		fields := []any{"temp_c", c, "source", src}
 		if c >= thermalHighC {
 			slog.Warn("modem temperature HIGH — 考虑提高 CELLBRIDGE_SMS_POLL_INTERVAL 或改善散热", fields...)
-		} else if throttle.shouldLog(c, time.Now()) {
+			return 30 * time.Second
+		}
+		if throttle.shouldLog(c, time.Now()) {
 			slog.Info("modem temperature", fields...)
 		} else {
 			slog.Debug("modem temperature", fields...)
 		}
+		if c >= 55 {
+			return 30 * time.Second
+		}
+		return 60 * time.Second
 	}
-	read()
+	next := read()
+	timer := time.NewTimer(next)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			timer.Reset(read())
+		}
+	}
+}
+
+func statusMonitor(ctx context.Context, m *at.Adapter, capabilities modem.Capabilities, app *api.Server) {
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			read()
 		}
+		if app.CallModem != nil {
+			if phys, ok := app.CallModem.(interface{ PhysicalCallID() modem.CallID }); ok && phys.PhysicalCallID() != "" {
+				continue // skip AT status polling while a voice call is active
+			}
+		}
+		statusCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		status, err := m.Status(statusCtx)
+		cancel()
+		if err != nil {
+			slog.Debug("periodic modem status refresh skipped", "error", err)
+			continue
+		}
+		if capabilities.Tier == modem.CapabilitySMSOnly {
+			status.Voice = "unavailable"
+		} else if app.VoiceAudio != nil {
+			status.Voice = "ready"
+		} else {
+			status.Voice = "control_only"
+		}
+		status.CapabilityTier = capabilities.Tier
+		app.SetLineStatus(status)
 	}
 }
 
