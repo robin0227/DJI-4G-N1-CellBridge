@@ -4,18 +4,35 @@ START=99
 STOP=10
 USE_PROCD=1
 
-PROG=/mnt/mmcblk2p4/cellbridge/run-staging.sh
+# Set explicitly by install.sh, or auto-detected below across common OpenWrt/iStoreOS mount points.
+PROG=
+
+resolve_prog() {
+	if [ -n "$PROG" ] && [ -x "$PROG" ]; then
+		echo "$PROG"
+		return 0
+	fi
+	for candidate in /mnt/data/cellbridge/run-staging.sh /mnt/mmcblk2p4/cellbridge/run-staging.sh /opt/cellbridge/run-staging.sh; do
+		if [ -x "$candidate" ]; then
+			echo "$candidate"
+			return 0
+		fi
+	done
+	return 1
+}
 
 start_service() {
-	[ -x "$PROG" ] || {
-		echo "missing executable: $PROG" >&2
+	RESOLVED_PROG=$(resolve_prog) || {
+		echo "missing executable run-staging.sh (checked PROG=$PROG and default mount paths)" >&2
 		return 1
 	}
 
 	procd_open_instance
-	procd_set_param command "$PROG"
-	# Keep recovering after a temporarily absent USB module. Retry 0 is unlimited.
-	procd_set_param respawn 3600 15 0
+	procd_set_param command "$RESOLVED_PROG"
+	# Prioritize real-time 20ms RTP/ALSA audio above background router workloads.
+	procd_set_param nice -10
+	# Fast recovery after a temporarily absent USB module. Retry 0 is unlimited.
+	procd_set_param respawn 3600 5 0
 	procd_set_param limits core="0"
 	procd_set_param stdout 1
 	procd_set_param stderr 1

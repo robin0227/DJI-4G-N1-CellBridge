@@ -2,11 +2,22 @@
 """Local non-billable SIP smoke checks. Query REGISTER does not change binding."""
 import hashlib
 import json
+from pathlib import Path
 import re
 import socket
 import uuid
 
-with open('/mnt/mmcblk2p4/cellbridge/run/config.yaml') as handle:
+HERE = Path(__file__).resolve().parent
+CANDIDATES = [
+    Path('/tmp/cellbridge/config.yaml'),
+    HERE / 'config.yaml',
+    HERE.parent / 'run/config.yaml',
+]
+config_path = next((p for p in CANDIDATES if p.is_file()), None)
+if config_path is None:
+    raise SystemExit('config.yaml not found in /tmp/cellbridge or install run/')
+
+with config_path.open() as handle:
     config = json.load(handle)
 user = config['sip']['users'][0]
 realm = config['sip']['realm']

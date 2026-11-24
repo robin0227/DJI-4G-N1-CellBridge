@@ -41,10 +41,10 @@ jobs:
         run: sh tools/build.sh
       - uses: actions/upload-artifact@v7
         with:
-          name: cellbridge-n1-openwrt-linux-arm64
+          name: cellbridge-openwrt-linux-arm64
           path: |
             dist/cellbridge-gateway-linux-arm64
             dist/SHA256SUMS
-            dist/cellbridge-n1-openwrt.tar.gz
+            dist/cellbridge-openwrt-arm64.tar.gz
           if-no-files-found: error
           retention-days: 14

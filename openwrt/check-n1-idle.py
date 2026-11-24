@@ -2,18 +2,47 @@
 """Read-only call safety check on the spare AT interface; never prints numbers."""
 import glob
 import os
+from pathlib import Path
 import select
 import sys
 import termios
 import time
 
-for path in glob.glob('/proc/asound/card*/pcm*/sub*/status'):
+
+def find_qdc507_card_glob():
+    for card_dir in Path('/sys/class/sound').glob('card*'):
+        id_file = card_dir / 'id'
+        if id_file.is_file() and id_file.read_text(errors='ignore').strip() == 'EG25GQDC507':
+            return f'/proc/asound/{card_dir.name}/pcm*/sub*/status'
+    return '/proc/asound/card*/pcm*/sub*/status'
+
+
+def find_spare_at_tty():
+    for dev in Path('/sys/bus/usb/devices').glob('*'):
+        vid_f, pid_f = dev / 'idVendor', dev / 'idProduct'
+        if not (vid_f.is_file() and pid_f.is_file()):
+            continue
+        vid = vid_f.read_text(errors='ignore').strip()
+        pid = pid_f.read_text(errors='ignore').strip()
+        if (vid, pid) not in (('2c7c', '0125'), ('2ca3', '4006')):
+            continue
+        for intf in dev.parent.glob(dev.name + ':*'):
+            ifn = intf / 'bInterfaceNumber'
+            if ifn.is_file() and ifn.read_text(errors='ignore').strip() == '03':
+                for tty in intf.glob('ttyUSB*'):
+                    cand = '/dev/' + tty.name
+                    if os.path.exists(cand):
+                        return cand
+    return '/dev/ttyUSB3'
+
+
+for path in glob.glob(find_qdc507_card_glob()):
     with open(path) as handle:
         status = handle.read()
     if any(state in status for state in ('RUNNING', 'PREPARED', 'DRAINING')):
         sys.exit('ABORT: host audio is active')
 
-fd = os.open('/dev/ttyUSB3', os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+fd = os.open(find_spare_at_tty(), os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
 try:
     attrs = termios.tcgetattr(fd)
     attrs[0] = 0

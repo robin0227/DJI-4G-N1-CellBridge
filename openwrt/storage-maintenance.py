@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Non-destructive online storage maintenance for this N1 installation."""
+"""Non-destructive online storage maintenance for an OpenWrt CellBridge installation."""
 import argparse
 import fcntl
 import json
@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import time
 
-BASE = Path('/mnt/mmcblk2p4/cellbridge')
+BASE = Path(__file__).resolve().parent
 LOG_LIMIT = 256 * 1024
 LOG_KEEP = 128 * 1024
 MIN_FREE = 512 * 1024 * 1024
@@ -116,8 +116,8 @@ def main():
     args = parser.parse_args()
     os.umask(0o077)
     try:
-        if not os.path.ismount(BASE.parent):
-            raise RuntimeError('data partition is not mounted')
+        if str(BASE.parent).startswith('/mnt/') and not os.path.ismount(BASE.parent):
+            raise RuntimeError('data partition is not mounted: ' + str(BASE.parent))
         # flock releases automatically on exit/crash; no stale lock recovery.
         with (BASE / 'run/storage-maintenance.lock').open('a') as lock:
             try:

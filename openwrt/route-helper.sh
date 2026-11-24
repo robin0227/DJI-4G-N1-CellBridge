@@ -3,10 +3,11 @@ set -eu
 
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 export PYTHONPATH="$DIR/vendor:$DIR/module-tools"
+export PYTHONDONTWRITEBYTECODE=1
 
 case "${1:-start}" in
 	start)
-		python3 -c 'import voice_runtime; voice_runtime.ensure_voice_route(force=True)'
+		python3 -B -c 'import voice_runtime; voice_runtime.ensure_voice_route(force=True)'
 		;;
 	status)
 		exec "$DIR/module-tools/adb" shell 'pidof mavo-pcm-bridge.armv7 2>/dev/null || pidof mavo-pcm-bridge 2>/dev/null; tail -n 3 /run/mavo-voice-route.log 2>/dev/null'

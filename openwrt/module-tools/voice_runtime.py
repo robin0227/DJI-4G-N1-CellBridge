@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-DjiPhone 模块侧语音运行时管理。
+DjiPhone 模块侧语音运行时管理（R76S / OpenWrt 性能加固版）。
 
-将 MaVo/DJOneHub 的 ADB 语音路由流程移植为 Python：
-1. 通过模块 ADB 接口（interface 6 / subclass 0x42）推送语音运行时组件；
-2. insmod qdc507 内核声卡驱动，启动 alsaucm VoLTE 校准；
-3. 运行 mavo-pcm-bridge 建立 D4/UAC 语音路由，使 USB 音频承载真实通话语音。
-
-运行时文件不在本仓库分发：经用户确认后从上游固定 commit 下载并做 SHA-256 校验
-（与 DJOneHub-mac-enhanced 的 OPEN_SOURCE_SCOPE 约定一致）。
+优化要点：
+1. 快速路由轮换（Fast-Path）：当模块侧 /tmp/mavo-call/mavo-pcm-bridge.armv7 哈希匹配、
+   qdc507_aprv3/qdc507_voice 已加载、ALSA 节点和 alsaucm VoLTE 校准均已就绪时，
+   单条 ADB shell 完成旧实例清理 + 新会话拉起 + RUNNING 等待，跳过每次通话重复推送
+   ~1 MB 的 .ko 文件，将每次通话前路由轮换从数秒压至亚秒级；
+2. 完整冷启动回退（Cold-Path）：模块重启或任意条件不满足时自动回退全量校验与按需推送
+   （仅推送模块侧缺失或 SHA-256 不一致的文件）；
+3. 修复 _bulk_read 将 ENODEV (errno=19) 误判为超时导致的 USB 断连死等；
+4. 缩短宽松等待上限，防止与 Go 侧 20s PrepareRoute 超时碰撞。
 """
 import hashlib
 import os
@@ -42,6 +44,7 @@ RUNTIME_FILES = [
     {'name': 'qdc507_voice.ko', 'mode': 0o644, 'sha256': 'ed3821682d5309969a01c764192c83feff9669c61ef237c69475cd1619cf296c'},
     {'name': 'mavo-pcm-bridge.armv7', 'mode': 0o755, 'sha256': '88d47c15e61d1428a59c821fed804c2e6490e82859a085062f21966b58d167fc'},
 ]
+BRIDGE_SHA256 = '88d47c15e61d1428a59c821fed804c2e6490e82859a085062f21966b58d167fc'
 KERNEL_RELEASE = '3.18.44'
 CARD_NAME = 'mdm9607-tomtom-i2s-snd-card'
 REQUIRED_DEVICES = ['/dev/snd/controlC0', '/dev/snd/pcmC0D4p', '/dev/snd/pcmC0D4c',
@@ -94,7 +97,7 @@ class ADBClient:
         if dev is None:
             dev = usb.core.find(idVendor=ALT_VENDOR_ID, idProduct=ALT_PRODUCT_ID)
         if dev is None:
-            raise ADBError('未找到 DJI/Quectel USB 模块 (2ca3:4006)')
+            raise ADBError('未找到 DJI/Quectel USB 模块 (2ca3:4006 / 2c7c:0125)')
         cfg = dev.get_active_configuration()
         target = None
         for intf in cfg:  # 每个 intf 是一个 altsetting 描述符
@@ -153,7 +156,10 @@ class ADBClient:
         try:
             return bytes(self.dev.read(self.ep_in, size, timeout=timeout_ms))
         except usb.core.USBError as e:
-            if 'timeout' in str(e).lower() or getattr(e, 'errno', None) in (19, 60, 110):
+            errno = getattr(e, 'errno', None)
+            # Only ETIMEDOUT (Linux=110, Darwin=60) or timeout text is retryable.
+            # ENODEV (19) means the USB device was disconnected and must fail fast.
+            if errno in (60, 110) or 'timeout' in str(e).lower():
                 return b''  # 超时 → 空读，由调用方的 deadline 逻辑处理
             raise ADBError(f'ADB bulk read: {e}')
 
@@ -391,6 +397,61 @@ def _device_checks_cmd():
     return ' && '.join(parts)
 
 
+def _fast_rotate_cmd():
+    """单条 shell 完成前置校验 + 轮换 mavo-pcm-bridge + 确认 RUNNING。
+    用子 shell 包裹，确保内部 exit 码传给外层 __mavo_status 标记。
+    前置条件任一不满足时返回 88，触发冷启动全量部署路径。"""
+    helper = f'{VOICE_REMOTE_DIR}/mavo-pcm-bridge.armv7'
+    return (
+        '( '
+        'test "$(id -u)" = 0 || exit 88; '
+        f"test -x '{helper}' || exit 88; "
+        f'test "$(sha256sum \'{helper}\' 2>/dev/null | cut -d \' \' -f 1)" = \'{BRIDGE_SHA256}\' || exit 88; '
+        "grep -q '^qdc507_aprv3 ' /proc/modules && grep -q '^qdc507_voice ' /proc/modules || exit 88; "
+        f'{_device_checks_cmd()} || exit 88; '
+        'test -c /dev/ttyGS0 && test -p /run/voc_svr || exit 88; '
+        f"test -s '{CALIB_PID_FILE}' && read cpid cstart < '{CALIB_PID_FILE}' && "
+        'test -n "$cpid" && test -n "$cstart" && '
+        'test "$(cut -d \' \' -f 22 "/proc/$cpid/stat" 2>/dev/null)" = "$cstart" && '
+        f"grep -q 'ACDB -> Sent VocProc Cal!' '{CALIB_LOG_FILE}' 2>/dev/null || exit 88; "
+        "for p in $(pidof mavo-pcm-bridge.armv7 2>/dev/null); do kill -TERM \"$p\" 2>/dev/null || true; done; "
+        "n=0; while pidof mavo-pcm-bridge.armv7 >/dev/null 2>&1 && test \"$n\" -lt 15; do "
+        'sleep 0.1; n=$((n+1)); done; '
+        "if pidof mavo-pcm-bridge.armv7 >/dev/null 2>&1; then "
+        "for p in $(pidof mavo-pcm-bridge.armv7 2>/dev/null); do kill -KILL \"$p\" 2>/dev/null || true; done; "
+        "n=0; while pidof mavo-pcm-bridge.armv7 >/dev/null 2>&1 && test \"$n\" -lt 10; do "
+        'sleep 0.1; n=$((n+1)); done; fi; '
+        "pidof mavo-pcm-bridge.armv7 >/dev/null 2>&1 && exit 74; "
+        f"rm -f '{ROUTE_PID_FILE}' '{ROUTE_LOG_FILE}'; "
+        f"nohup '{helper}' --voice-route-session --verbose </dev/null >> '{ROUTE_LOG_FILE}' 2>&1 & pid=$!; "
+        'starttime=$(cut -d \' \' -f 22 "/proc/$pid/stat" 2>/dev/null); '
+        'case "$pid:$starttime" in :*|*:|*[!0-9:]*) exit 89;; *) '
+        f"printf '%s %s\\n' \"$pid\" \"$starttime\" > '{ROUTE_PID_FILE}';; esac; "
+        'active=0; n=0; while test "$n" -lt 40; do '
+        'kill -0 "$pid" 2>/dev/null || exit 89; '
+        f"if grep -q 'VoLTE route session active on hw:0,4' '{ROUTE_LOG_FILE}' 2>/dev/null; then "
+        'active=1; '
+        'if test "$(cat /sys/class/android_usb/f_audio/audio_enable 2>/dev/null)" = 1 && '
+        "grep -q '^state: RUNNING' /proc/asound/card0/pcm4p/sub0/status 2>/dev/null && "
+        "grep -q '^state: RUNNING' /proc/asound/card0/pcm4c/sub0/status 2>/dev/null; then "
+        'exit 0; fi; fi; '
+        'sleep 0.1; n=$((n+1)); done; '
+        'test "$active" -eq 1 && exit 0 || exit 89 '
+        ')'
+    )
+
+
+def _try_fast_rotate(adb):
+    """快速热轮换路由。返回 True 表示已就绪；False 表示需走完整冷启动部署。"""
+    try:
+        _, status = adb.shell_checked(_fast_rotate_cmd(), 12.0)
+        return status == 0
+    except ADBAuthRequired:
+        raise
+    except ADBError:
+        return False
+
+
 def _ensure_calibration(adb):
     cmd = (
         "owned=0; "
@@ -438,7 +499,7 @@ def _route_is_ready(adb):
 
 def _route_is_active(adb):
     """宽松判定：bridge 进程存活且日志已报告 VoLTE route session active。
-    （audio_enable 与 PCM RUNNING 需等 Mac 打开 UAC 流，可能滞后数秒）"""
+    （audio_enable 与 PCM RUNNING 需等主机打开 UAC 流，可能滞后数秒）"""
     return _route_state(adb, strict=False)
 
 
@@ -479,6 +540,21 @@ def _route_is_stopped(adb):
     return status == 0
 
 
+def _remote_hashes(adb):
+    """一次性查询模块端已存在的运行时文件 SHA-256，避免重复 push 大文件。"""
+    paths = ' '.join(f"'{VOICE_REMOTE_DIR}/{f['name']}'" for f in RUNTIME_FILES)
+    try:
+        out, _ = adb.shell_checked(f'sha256sum {paths} 2>/dev/null || true', 8)
+    except ADBError:
+        return {}
+    hashes = {}
+    for line in out.splitlines():
+        parts = line.strip().split()
+        if len(parts) >= 2 and len(parts[0]) == 64:
+            hashes[os.path.basename(parts[-1])] = parts[0].lower()
+    return hashes
+
+
 def ensure_voice_route(force=False):
     """确保模块侧 D4/UAC 语音路由就绪。成功返回 True；失败抛 ADBError。"""
     with _state['lock']:
@@ -502,11 +578,26 @@ def ensure_voice_route(force=False):
 
 
 def _start_voice_route(force=False):
-    installed, detail = runtime_installed()
-    if not installed:
-        raise ADBError(f'缺少模块侧语音运行时：{detail}（请在设置中先安装）')
     adb = ADBClient()
     try:
+        # 热路径：模块运行时、驱动、校准均已就绪时，单次 ADB 命令完成路由轮换
+        if force and _try_fast_rotate(adb):
+            return
+        if not force and (_route_is_ready(adb) or _route_is_active(adb)):
+            return
+
+        # 若快速轮换期间发生 USB 重枚举，先重连一次 ADB 再继续冷启动路径
+        if not adb.connected:
+            adb.close()
+            time.sleep(1.5)
+            adb = ADBClient()
+            if _route_is_ready(adb):
+                return
+
+        installed, detail = runtime_installed()
+        if not installed:
+            raise ADBError(f'缺少模块侧语音运行时：{detail}（请在设置中先安装）')
+
         out, status = adb.shell_checked('id -u', 8)
         if status != 0 or '0' not in out.split():
             raise ADBError(f'模块 ADB 没有 root 控制权限（id -u 返回 {out.strip()!r}）')
@@ -514,19 +605,24 @@ def _start_voice_route(force=False):
         if status != 0 or KERNEL_RELEASE not in release:
             raise ADBError(f'模块内核版本与通话驱动不匹配：需要 {KERNEL_RELEASE}，实际 {release.strip()}')
         _voice_shell(adb, f"mkdir -p '{VOICE_REMOTE_DIR}' && chmod 700 '{VOICE_REMOTE_DIR}'", 8)
+
+        existing = _remote_hashes(adb)
         for f in RUNTIME_FILES:
+            if existing.get(f['name']) == f['sha256']:
+                continue
             with open(os.path.join(RUNTIME_DIR, f['name']), 'rb') as fh:
                 data = fh.read()
             adb.push(data, f'{VOICE_REMOTE_DIR}/{f["name"]}', 0o100000 | f['mode'], 30)
+
         # 声卡设备检查/驱动加载
         _, status = adb.shell_checked(_device_checks_cmd(), 8)
         sound_ready = status == 0
         if not sound_ready:
-            _, status, = adb.shell_checked("grep -q '^qdc507_voice ' /proc/modules", 8)
+            _, status = adb.shell_checked("grep -q '^qdc507_voice ' /proc/modules", 8)
             if status == 0:
                 raise ADBError('检测到旧版 qdc507_voice 声卡仍在内核中；为避免热切换语音驱动，请重启模块后再试')
             for mod in MODULES:
-                _, present, = adb.shell_checked(f"grep -q '^{mod['name']} ' /proc/modules", 8)
+                _, present = adb.shell_checked(f"grep -q '^{mod['name']} ' /proc/modules", 8)
                 if present == 0:
                     continue
                 try:
@@ -549,15 +645,19 @@ def _start_voice_route(force=False):
         _voice_shell(adb, f"'{VOICE_REMOTE_DIR}/mavo-pcm-bridge.armv7' --check", 15)
         # 路由已就绪？
         if not force:
-            if _route_is_ready(adb):
+            if _route_is_ready(adb) or _route_is_active(adb):
                 return
-            if _route_is_active(adb):
-                return  # 旧实例仍在服务，直接视为就绪
-        # 清理残留 bridge（避免 PCM EBUSY）再启动（[.] 防止 pkill 匹配到自身 shell）
-        _voice_shell(adb, "pkill -f 'mavo-pcm-bridge[.]armv7' 2>/dev/null; "
-                          "n=0; while pgrep -f 'mavo-pcm-bridge[.]armv7' >/dev/null && test \"$n\" -lt 30; do "
-                          'sleep 0.1; n=$((n+1)); done; pgrep -f "mavo-pcm-bridge[.]armv7" >/dev/null && exit 74; '
-                          f"rm -f '{ROUTE_PID_FILE}' '{ROUTE_LOG_FILE}'", 15)
+        # 清理残留 bridge（避免 PCM EBUSY）再启动（用 pidof 绝不误杀 shell）
+        _voice_shell(adb, "( "
+                          "for p in $(pidof mavo-pcm-bridge.armv7 2>/dev/null); do kill -TERM \"$p\" 2>/dev/null || true; done; "
+                          "n=0; while pidof mavo-pcm-bridge.armv7 >/dev/null 2>&1 && test \"$n\" -lt 20; do "
+                          'sleep 0.1; n=$((n+1)); done; '
+                          "if pidof mavo-pcm-bridge.armv7 >/dev/null 2>&1; then "
+                          "for p in $(pidof mavo-pcm-bridge.armv7 2>/dev/null); do kill -KILL \"$p\" 2>/dev/null || true; done; "
+                          "n=0; while pidof mavo-pcm-bridge.armv7 >/dev/null 2>&1 && test \"$n\" -lt 10; do "
+                          'sleep 0.1; n=$((n+1)); done; fi; '
+                          "pidof mavo-pcm-bridge.armv7 >/dev/null 2>&1 && exit 74; "
+                          f"rm -f '{ROUTE_PID_FILE}' '{ROUTE_LOG_FILE}' )", 15)
         helper = f'{VOICE_REMOTE_DIR}/mavo-pcm-bridge.armv7'
         launch = (f"rm -f '{ROUTE_PID_FILE}' '{ROUTE_LOG_FILE}'; "
                   f"nohup '{helper}' --voice-route-session --verbose "
@@ -582,8 +682,8 @@ def _start_voice_route(force=False):
             if _route_is_ready(adb):
                 return
             if _route_is_active(adb):
-                # bridge 已激活，等 Mac 打开 UAC 流后 RUNNING 会跟上
-                for _ in range(100):
+                # bridge 已激活，短暂等待 RUNNING 就绪（上限 5s，避免撞上 Go 20s 超时）
+                for _ in range(25):
                     if _route_is_ready(adb):
                         return
                     time.sleep(0.2)
