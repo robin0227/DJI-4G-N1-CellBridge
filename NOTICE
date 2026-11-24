@@ -18,7 +18,7 @@ Source origins:
    https://github.com/pyusb/pyusb. The license and copyright notices are
    preserved in licenses/PyUSB-BSD.txt and in the source files.
 
-4. N1 deployment, maintenance, checks and packaging additions: MIT,
+4. OpenWrt ARM (NanoPi R76S, N1, etc.) deployment, maintenance, checks and packaging additions: MIT,
    Copyright (c) 2026 robin0227.
 
 Go dependency versions and checksums are locked in gateway/go.mod and

@@ -1,9 +1,9 @@
 # 安全与隐私
 
-这是能产生话费、接收短信和访问模块 ADB root 的网关。仅在你拥有授权的模块、SIM、N1 和可信网络中使用，不用于未经许可的通信拦截。
+这是能产生话费、接收短信和访问模块 ADB root 的网关。仅在你拥有授权的模块、SIM、OpenWrt 设备和可信网络中使用，不用于未经许可的通信拦截。
 
 - SIP 服务监听所有本地接口，HTTP 管理默认 `127.0.0.1:8787`；请自行限制 OpenWrt firewall 与 Tailscale ACL，不进行公网端口转发。
-- 每台部署生成随机密码；严禁公开 `cellbridge.secrets.env`、生成的 config.yaml、push token、VPN 身份文件或 SSH 私钥。
+- 每台部署生成随机密码；严禁公开 `cellbridge.secrets.env`、`cellbridge.env`、生成的 `config.yaml`、push token、VPN 身份文件或 SSH 私钥。
 - 配置中的 `redact_logs` 不表示所有 SIP/模块日志都已无隐私。原始日志可能含号码、Contact 和网络地址，分享前人工脱敏。
 - 录音默认关闭。数据库含真实通信历史，不能作为普通构建产物上传。
 - 模块 kernel/runtime 文件不是本仓库 MIT 许可的一部分，使用者自行核对权利和兼容性。
